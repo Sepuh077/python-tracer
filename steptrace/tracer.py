@@ -2,12 +2,15 @@ import sys
 import os
 import time
 import inspect
+from typing import List
+from pathlib import Path
 
 
 class Tracer:
-    def __init__(self, filter_workspace=True, log_dir=".tracer"):
+    def __init__(self, filter_workspace: bool = True, log_dir: Path | str = ".tracer", tracable_functions: List[str] = None):
         self.workspace = os.path.dirname(os.path.abspath(inspect.stack()[-1].filename))
         self.filter_workspace = filter_workspace
+        self.tracable_functions = tracable_functions
 
         self.log_path = os.path.join(log_dir, "tracer.log")
         if os.path.exists(self.log_path):
@@ -40,6 +43,9 @@ class Tracer:
         if "builtin" in type(var).__name__:
             return False
         return True
+
+    def _is_tracable_func(self, func):
+        return self.tracable_functions is None or func in self.tracable_functions
 
     def _is_jupyter_notebook(self):
         try:
@@ -92,7 +98,7 @@ class Tracer:
         return text
 
     def _log(self, frame):
-        if not self._is_tracable(frame.f_code.co_filename):
+        if not self._is_tracable(frame.f_code.co_filename) or not self._is_tracable_func(frame.f_code.co_name):
             return
         self._step += 1
         step_root = self._file(frame)
