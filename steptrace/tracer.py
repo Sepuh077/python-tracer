@@ -5,26 +5,31 @@ import inspect
 
 
 class Tracer:
-    def __init__(self):
+    def __init__(self, filter_workspace=True, log_dir=".tracer"):
         self.workspace = os.path.dirname(os.path.abspath(inspect.stack()[-1].filename))
+        self.filter_workspace = filter_workspace
 
-        self.log_path = os.path.join(self.workspace, ".tracer", "tracer.log")
+        self.log_path = os.path.join(log_dir, "tracer.log")
         if os.path.exists(self.log_path):
             counter = 1
             while os.path.exists(
-                        os.path.join(self.workspace, ".tracer", f"tracer_{counter}.log")
+                        os.path.join(log_dir, f"tracer_{counter}.log")
                     ):
                 counter += 1
-            self.log_path = os.path.join(self.workspace, ".tracer", f"tracer_{counter}.log")
+            self.log_path = os.path.join(log_dir, f"tracer_{counter}.log")
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         self.timer = None
 
     def _is_tracable(self, filename):
-        if filename.startswith("<") or not filename.startswith(self.workspace) or filename == __file__:
+        if filename.startswith("<") or filename == __file__:
             return False
 
-        if "site-packages" in filename or filename == "built-in":
-            return False
+        if self.filter_workspace:
+            if not filename.startswith(self.workspace):
+                return False
+
+            if "site-packages" in filename or filename == "built-in":
+                return False
 
         return True
 
@@ -105,7 +110,7 @@ class Tracer:
         sys.settrace(self._previous_trace)
         return False
 
-    def tracer(self, func):
+    def trace(self, func):
         def wrap():
             self.step = 0
             self.timer = time.perf_counter()
