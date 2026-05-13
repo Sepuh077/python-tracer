@@ -31,6 +31,10 @@ Examples:
     python -m steptrace run script.py --trace-async
     python -m steptrace run script.py --config config.yaml
     python -m steptrace run script.py -- arg1 arg2  (args after -- go to script)
+    python -m steptrace run script.py --export            (structured JSON export)
+    python -m steptrace run script.py --export out.json   (custom export path)
+    python -m steptrace view                              (view latest trace)
+    python -m steptrace view .tracer/trace.json           (view specific file)
         """,
     )
 
@@ -95,6 +99,28 @@ Examples:
         metavar="MS",
     )
 
+    # Structured export option
+    run_parser.add_argument(
+        "--export",
+        nargs="?",
+        const=True,
+        default=None,
+        help="Export structured trace data to JSON for interactive viewing. "
+        "Optionally specify output file path (default: .tracer/trace.json)",
+        metavar="FILE",
+    )
+
+    # View command
+    view_parser = subparsers.add_parser(
+        "view", help="Interactively view a structured trace file"
+    )
+    view_parser.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="Path to the trace JSON file (default: most recent in .tracer/)",
+    )
+
     return parser
 
 
@@ -149,11 +175,23 @@ def run_script(args):
     trace_async = tracer_kwargs.pop("trace_async", False)
     async_threshold_ms = tracer_kwargs.pop("async_threshold_ms", 0.0)
 
+    # Determine if structured export is requested
+    export_flag = getattr(args, "export", None)
+
     # Override workspace to be the script's directory
     tracer_kwargs["_workspace_override"] = script_dir
 
     # Create the tracer
-    if trace_async:
+    if export_flag is not None:
+        from .structured_tracer import StructuredTracer
+
+        export_path = None if export_flag is True else export_flag
+        tracer = StructuredTracer(
+            export_path=export_path,
+            script_path=script_path,
+            **tracer_kwargs,
+        )
+    elif trace_async:
         from .async_tracer import AsyncTracer
 
         tracer = AsyncTracer(
@@ -165,14 +203,21 @@ def run_script(args):
 
     # Run the script with tracing
     print(f"Tracing: {script_path}")
-    if tracer.log_path:
+    if hasattr(tracer, "export_path"):
+        print(f"Structured trace output: {tracer.export_path}")
+    elif tracer.log_path:
         print(f"Log output: {tracer.log_path}")
 
     try:
         with tracer:
             exec(compiled, script_globals)
+        if hasattr(tracer, "export_path"):
+            print(f"Structured trace saved to: {tracer.export_path}")
+            print(f"View with: python -m steptrace view {tracer.export_path}")
         return 0
     except SystemExit as e:
+        if hasattr(tracer, "export_path"):
+            print(f"Structured trace saved to: {tracer.export_path}")
         return e.code if isinstance(e.code, int) else 0
     except Exception as e:
         print(f"Error running script: {e}", file=sys.stderr)
@@ -198,6 +243,10 @@ def main():
             script_args = script_args[1:]
         args.script_args = script_args
         return run_script(args)
+    elif args.command == "view":
+        from .viewer import main as viewer_main
+
+        return viewer_main(getattr(args, "file", None))
     else:
         parser.print_help()
         return 0
