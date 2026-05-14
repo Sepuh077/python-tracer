@@ -13,6 +13,7 @@ Usage:
     # Then view with: python -m steptrace view
 """
 
+import inspect
 import json
 import os
 import sys
@@ -81,6 +82,11 @@ class StructuredTracer(Tracer):
         self._scope_vars: Dict[int, dict] = {}
         self._prev_line: Dict[int, int] = {}
         self._start_time = 0.0
+
+        # Async coroutine tracking
+        self._coro_frame_nodes: Dict[int, dict] = {}
+        self._coro_frames: Dict[int, object] = {}  # prevent frame id reuse
+        self._orphan_parent: Optional[dict] = None
 
     @property
     def export_path(self) -> str:
@@ -209,16 +215,44 @@ class StructuredTracer(Tracer):
             return self._run_tracer
 
         try:
+            is_coro = bool(frame.f_code.co_flags & inspect.CO_COROUTINE)
+            frame_id = id(frame)
+
             if event == "call":
                 if not self._is_tracable_func(func_name):
                     self._timer = time.perf_counter()
                     return self._run_tracer
 
+                # --- Coroutine resumption detection ---
+                # Python fires a "call" event every time a coroutine resumes
+                # after an await.  Reuse the existing node instead of creating
+                # a duplicate.
+                if is_coro and frame_id in self._coro_frame_nodes:
+                    existing = self._coro_frame_nodes[frame_id]
+                    if existing["name"] == func_name:
+                        # Valid resumption – push the same node back
+                        self._call_stack.append(existing)
+                        self._frame_to_node[frame_id] = existing
+                        self._timer = time.perf_counter()
+                        return self._run_tracer
+                    else:
+                        # Stale entry (memory address reused by a new coro)
+                        del self._coro_frame_nodes[frame_id]
+                        self._scope_vars.pop(frame_id, None)
+                        self._prev_line.pop(frame_id, None)
+                        # Fall through to "new call" below
+
+                # --- New call ---
                 self._step += 1
 
-                # Detect kind (module / method / function)
+                # Detect kind (module / method / function / async variants)
                 class_name = None
-                kind = "module" if func_name == "<module>" else "function"
+                if func_name == "<module>":
+                    kind = "module"
+                elif is_coro:
+                    kind = "async_function"
+                else:
+                    kind = "function"
                 args = {}
 
                 if "self" in frame.f_locals:
@@ -226,7 +260,7 @@ class StructuredTracer(Tracer):
                         class_name = type(frame.f_locals["self"]).__name__
                     except Exception:
                         class_name = "unknown"
-                    kind = "method"
+                    kind = "async_method" if is_coro else "method"
                 elif "cls" in frame.f_locals:
                     try:
                         class_name = frame.f_locals["cls"].__name__
@@ -251,17 +285,48 @@ class StructuredTracer(Tracer):
                     args=args,
                 )
 
-                # Add as child of current top-of-stack node
-                if self._call_stack:
+                if is_coro:
+                    node["_is_coro"] = True
+
+                # --- Parent assignment ---
+                parent_assigned = False
+
+                if is_coro:
+                    # For a new coroutine, prefer a coroutine ancestor on
+                    # the call stack (handles sequential `await`).
+                    for n in reversed(self._call_stack):
+                        if n.get("_is_coro"):
+                            n["calls"].append(node)
+                            parent_assigned = True
+                            break
+
+                    # No coroutine ancestor → orphan (e.g. from gather /
+                    # create_task).  Attach to the most recently suspended
+                    # non-orphan coroutine.
+                    if not parent_assigned and self._orphan_parent is not None:
+                        self._orphan_parent["calls"].append(node)
+                        node["_orphan"] = True
+                        parent_assigned = True
+
+                # Fallback: use whatever is on top of the call stack.
+                if not parent_assigned and self._call_stack:
                     self._call_stack[-1]["calls"].append(node)
+                    parent_assigned = True
 
                 # Set as root if this is the very first node
                 if self._root_node is None:
                     self._root_node = node
 
                 self._call_stack.append(node)
-                self._frame_to_node[id(frame)] = node
-                self._prev_line[id(frame)] = frame.f_lineno
+                self._frame_to_node[frame_id] = node
+                self._prev_line[frame_id] = frame.f_lineno
+
+                if is_coro:
+                    self._coro_frame_nodes[frame_id] = node
+                    # Hold a strong reference so the frame is not
+                    # garbage-collected and its id() is not reused by
+                    # a later coroutine of the same function.
+                    self._coro_frames[frame_id] = frame
 
             elif event == "line":
                 if not self._is_tracable_func(func_name):
@@ -269,7 +334,6 @@ class StructuredTracer(Tracer):
                     return self._run_tracer
 
                 self._step += 1
-                frame_id = id(frame)
 
                 # Create module node for top-level code (no call event for exec'd code)
                 if not self._call_stack:
@@ -298,9 +362,12 @@ class StructuredTracer(Tracer):
                 self._prev_line[frame_id] = frame.f_lineno
 
             elif event == "return":
-                frame_id = id(frame)
-                if frame_id in self._frame_to_node:
-                    node = self._frame_to_node[frame_id]
+                if is_coro and frame_id in self._coro_frame_nodes:
+                    # Coroutine return – may be a suspension (yield to the
+                    # event loop) or a real completion.  We can't tell which,
+                    # so we tentatively update the node but keep all tracking
+                    # data alive for a potential resumption.
+                    node = self._coro_frame_nodes[frame_id]
                     node["step_end"] = self._step
                     node["duration_ms"] = round(
                         (time.perf_counter() - node.get("_start_time", self._timer))
@@ -314,14 +381,44 @@ class StructuredTracer(Tracer):
                     except Exception:
                         node["return_value"] = "<unrepresentable>"
 
-                    # Pop from call stack
+                    # Pop from call stack (will be re-pushed on resumption)
                     if self._call_stack and self._call_stack[-1] is node:
                         self._call_stack.pop()
 
-                    # Cleanup tracking data for this frame
-                    del self._frame_to_node[frame_id]
-                    self._scope_vars.pop(frame_id, None)
-                    self._prev_line.pop(frame_id, None)
+                    # A non-orphan coroutine that just suspended becomes the
+                    # candidate parent for upcoming orphan coroutines (e.g.
+                    # ones started by asyncio.gather / create_task).
+                    if not node.get("_orphan"):
+                        self._orphan_parent = node
+
+                    # Do NOT delete from _frame_to_node, _scope_vars,
+                    # _prev_line, or _coro_frame_nodes – they are needed if
+                    # the coroutine resumes later.
+                else:
+                    # Normal synchronous return – clean up as usual.
+                    if frame_id in self._frame_to_node:
+                        node = self._frame_to_node[frame_id]
+                        node["step_end"] = self._step
+                        node["duration_ms"] = round(
+                            (time.perf_counter() - node.get("_start_time", self._timer))
+                            * 1000,
+                            4,
+                        )
+                        try:
+                            node["return_value"] = (
+                                self._repr(arg, max_len=300) if arg is not None else None
+                            )
+                        except Exception:
+                            node["return_value"] = "<unrepresentable>"
+
+                        # Pop from call stack
+                        if self._call_stack and self._call_stack[-1] is node:
+                            self._call_stack.pop()
+
+                        # Cleanup tracking data for this frame
+                        del self._frame_to_node[frame_id]
+                        self._scope_vars.pop(frame_id, None)
+                        self._prev_line.pop(frame_id, None)
 
         except Exception:
             pass  # Never crash the user's program
@@ -334,6 +431,8 @@ class StructuredTracer(Tracer):
         if node is None:
             return None
         node.pop("_start_time", None)
+        node.pop("_is_coro", None)
+        node.pop("_orphan", None)
         node["variables"] = list(node["variables"].values())
         for child in node.get("calls", []):
             self._clean_node(child)
@@ -373,6 +472,9 @@ class StructuredTracer(Tracer):
         self._scope_vars = {}
         self._prev_line = {}
         self._start_time = time.perf_counter()
+        self._coro_frame_nodes = {}
+        self._coro_frames = {}
+        self._orphan_parent = None
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         sys.settrace(self._previous_trace)
