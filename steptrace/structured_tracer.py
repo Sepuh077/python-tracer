@@ -24,6 +24,44 @@ from typing import Dict, List, Optional
 
 from .tracer import LogLevel, LogOutput, Tracer
 
+# ── Type config loader ──────────────────────────────────────────────────────
+
+def load_type_config(filepath: str) -> dict:
+    """Load a Python type config file and return the CONFIG mapping.
+
+    The file must define a top-level ``CONFIG`` dict that maps types to
+    property names (a single string) or lists of property names.  Example::
+
+        import numpy as np
+        CONFIG = {
+            np.ndarray: "shape",
+        }
+
+    Returns:
+        A dict mapping each type to a **list** of property name strings.
+    """
+    import importlib.util
+
+    filepath = os.path.abspath(filepath)
+    spec = importlib.util.spec_from_file_location("_steptrace_type_config", filepath)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    raw = getattr(mod, "CONFIG", None)
+    if raw is None:
+        raise ValueError(f"Type config file {filepath} must define a CONFIG dict")
+    if not isinstance(raw, dict):
+        raise TypeError(f"CONFIG in {filepath} must be a dict, got {type(raw).__name__}")
+
+    # Normalise: single string → one-element list
+    normalised: dict = {}
+    for typ, props in raw.items():
+        if isinstance(props, str):
+            props = [props]
+        normalised[typ] = list(props)
+    return normalised
+
+
 # Types to skip when tracking variables (we only want data, not code objects)
 _SKIP_VAR_TYPES = (
     types.FunctionType,
@@ -55,12 +93,16 @@ class StructuredTracer(Tracer):
         export_path: str = None,
         script_path: str = None,
         log_dir: str = ".tracer",
+        type_config: dict = None,
         **kwargs,
     ):
         # Force no text output - structured tracer only produces JSON
         kwargs["log_level"] = LogLevel.SILENT
         kwargs["log_output"] = LogOutput.STDOUT  # prevents log file creation
         kwargs["log_dir"] = log_dir
+
+        # type_config: {type -> [prop_name, ...]} loaded by load_type_config()
+        self._type_config = type_config or {}
 
         # Fix workspace detection: the base Tracer uses stack[1] which would
         # point at *this* __init__, not the user's code. Pass it through.
@@ -139,11 +181,30 @@ class StructuredTracer(Tracer):
         except Exception:
             return "<unrepresentable>"
 
+    def _get_type_config_props(self, value):
+        """Return the list of property names to export for *value*'s type.
+
+        Checks both exact type match and ``isinstance`` so that sub-classes
+        also benefit from a parent-class config entry.
+        """
+        for typ, props in self._type_config.items():
+            if isinstance(value, typ):
+                return props
+        return []
+
     def _serialize_instance(self, value, max_depth=4, max_attrs=50, _seen=None):
-        """Serialize a class instance's __dict__ recursively for inspection."""
-        if isinstance(value, _BASIC_TYPES + _SKIP_VAR_TYPES):
+        """Serialize a class instance's attributes for inspection.
+
+        Serializes ``__dict__`` entries and, if the type appears in the
+        type config, any additional properties listed there.
+        """
+        has_dict = hasattr(value, '__dict__')
+        extra_props = self._get_type_config_props(value)
+
+        # Nothing to serialize if it's a basic/skip type with no config props
+        if isinstance(value, _BASIC_TYPES + _SKIP_VAR_TYPES) and not extra_props:
             return None
-        if not hasattr(value, '__dict__'):
+        if not has_dict and not extra_props:
             return None
 
         if _seen is None:
@@ -156,35 +217,57 @@ class StructuredTracer(Tracer):
         _seen.add(obj_id)
         result = {}
 
-        try:
-            attrs = value.__dict__
-        except Exception:
-            _seen.discard(obj_id)
-            return None
+        # ---- __dict__ attributes ----
+        if has_dict:
+            try:
+                attrs = value.__dict__
+            except Exception:
+                attrs = {}
 
-        count = 0
-        for attr_name, attr_value in attrs.items():
-            if attr_name.startswith('__') and attr_name.endswith('__'):
-                continue
-            if count >= max_attrs:
-                result["..."] = {
-                    "value": f"<{len(attrs) - count} more attributes>",
-                    "type": "...",
+            count = 0
+            for attr_name, attr_value in attrs.items():
+                if attr_name.startswith('__') and attr_name.endswith('__'):
+                    continue
+                if count >= max_attrs:
+                    result["..."] = {
+                        "value": f"<{len(attrs) - count} more attributes>",
+                        "type": "...",
+                    }
+                    break
+
+                entry = {
+                    "value": self._repr(attr_value, max_len=200),
+                    "type": type(attr_value).__name__,
                 }
-                break
 
+                nested = self._serialize_instance(
+                    attr_value, max_depth - 1, max_attrs, _seen)
+                if nested:
+                    entry["attrs"] = nested
+
+                result[attr_name] = entry
+                count += 1
+
+        # ---- Type-config extra properties ----
+        for prop_name in extra_props:
+            if prop_name in result:
+                continue  # already covered by __dict__
+            try:
+                prop_value = getattr(value, prop_name)
+            except Exception:
+                continue
+            # Skip callable results (methods, bound functions, etc.)
+            if callable(prop_value) and not isinstance(prop_value, _BASIC_TYPES):
+                continue
             entry = {
-                "value": self._repr(attr_value, max_len=200),
-                "type": type(attr_value).__name__,
+                "value": self._repr(prop_value, max_len=200),
+                "type": type(prop_value).__name__,
             }
-
             nested = self._serialize_instance(
-                attr_value, max_depth - 1, max_attrs, _seen)
+                prop_value, max_depth - 1, max_attrs, _seen)
             if nested:
                 entry["attrs"] = nested
-
-            result[attr_name] = entry
-            count += 1
+            result[prop_name] = entry
 
         _seen.discard(obj_id)
         return result if result else None
@@ -265,6 +348,21 @@ class StructuredTracer(Tracer):
 
         self._scope_vars[frame_id] = current
 
+    @staticmethod
+    def _is_class_body(frame):
+        """Detect if a frame is executing a class body.
+
+        Class bodies are compiled without ``CO_OPTIMIZED`` (0x01) and
+        ``CO_NEWLOCALS`` (0x02) flags, unlike regular functions which
+        always have both.  Module code also lacks these flags but has
+        ``co_name == "<module>"``, so the combination reliably identifies
+        class bodies.
+        """
+        code = frame.f_code
+        if code.co_name == "<module>":
+            return False
+        return not (code.co_flags & 0x03)
+
     def _run_tracer(self, frame, event, arg):
         """Trace handler that captures structured execution data."""
         filename = frame.f_code.co_filename
@@ -280,6 +378,11 @@ class StructuredTracer(Tracer):
 
             if event == "call":
                 if not self._is_tracable_func(func_name):
+                    self._timer = time.perf_counter()
+                    return self._run_tracer
+
+                # Skip class body execution – it is not a real function call.
+                if self._is_class_body(frame):
                     self._timer = time.perf_counter()
                     return self._run_tracer
 

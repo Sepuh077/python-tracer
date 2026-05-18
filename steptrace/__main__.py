@@ -110,6 +110,14 @@ Examples:
         metavar="FILE",
     )
 
+    # Type config for structured export
+    run_parser.add_argument(
+        "--type-config",
+        help="Path to a Python file defining a CONFIG dict that maps types "
+        "to extra properties to export (e.g. np.ndarray: 'shape')",
+        metavar="FILE",
+    )
+
     # View command
     view_parser = subparsers.add_parser(
         "view", help="Interactively view a structured trace file"
@@ -181,6 +189,18 @@ def run_script(args):
     # Override workspace to be the script's directory
     tracer_kwargs["_workspace_override"] = script_dir
 
+    # Load type config if specified (only relevant for structured export)
+    type_config = None
+    type_config_path = getattr(args, "type_config", None)
+    if type_config_path:
+        from .structured_tracer import load_type_config
+
+        try:
+            type_config = load_type_config(type_config_path)
+        except Exception as e:
+            print(f"Error loading type config: {e}", file=sys.stderr)
+            return 1
+
     # Create the tracer
     if export_flag is not None:
         from .structured_tracer import StructuredTracer
@@ -189,6 +209,7 @@ def run_script(args):
         tracer = StructuredTracer(
             export_path=export_path,
             script_path=script_path,
+            type_config=type_config,
             **tracer_kwargs,
         )
     elif trace_async:

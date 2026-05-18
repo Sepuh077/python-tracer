@@ -1,7 +1,7 @@
 from .tracer import LogLevel, LogOutput, Tracer, VariableMode
 from .async_tracer import AsyncTracer, AsyncContextTracer, traced_sleep
 from .config import load_config, find_config_file
-from .structured_tracer import StructuredTracer
+from .structured_tracer import StructuredTracer, load_type_config
 
 __all__ = [
     "Tracer",
@@ -14,4 +14,5 @@ __all__ = [
     "traced_sleep",
     "load_config",
     "find_config_file",
+    "load_type_config",
 ]

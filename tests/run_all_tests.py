@@ -40,6 +40,7 @@ def main():
         "test_config.py",
         "test_async_tracer.py",
         "test_cli.py",
+        "test_class_filter_and_type_config.py",
     ]
 
     print("\n" + "=" * 60)
