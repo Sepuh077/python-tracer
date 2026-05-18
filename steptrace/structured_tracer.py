@@ -34,6 +34,13 @@ _SKIP_VAR_TYPES = (
     type,
 )
 
+# Basic/primitive types whose __dict__ should not be inspected
+_BASIC_TYPES = (
+    int, float, str, bool, bytes, complex,
+    list, tuple, dict, set, frozenset,
+    type(None),
+)
+
 
 class StructuredTracer(Tracer):
     """
@@ -132,6 +139,56 @@ class StructuredTracer(Tracer):
         except Exception:
             return "<unrepresentable>"
 
+    def _serialize_instance(self, value, max_depth=4, max_attrs=50, _seen=None):
+        """Serialize a class instance's __dict__ recursively for inspection."""
+        if isinstance(value, _BASIC_TYPES + _SKIP_VAR_TYPES):
+            return None
+        if not hasattr(value, '__dict__'):
+            return None
+
+        if _seen is None:
+            _seen = set()
+
+        obj_id = id(value)
+        if obj_id in _seen or max_depth <= 0:
+            return None
+
+        _seen.add(obj_id)
+        result = {}
+
+        try:
+            attrs = value.__dict__
+        except Exception:
+            _seen.discard(obj_id)
+            return None
+
+        count = 0
+        for attr_name, attr_value in attrs.items():
+            if attr_name.startswith('__') and attr_name.endswith('__'):
+                continue
+            if count >= max_attrs:
+                result["..."] = {
+                    "value": f"<{len(attrs) - count} more attributes>",
+                    "type": "...",
+                }
+                break
+
+            entry = {
+                "value": self._repr(attr_value, max_len=200),
+                "type": type(attr_value).__name__,
+            }
+
+            nested = self._serialize_instance(
+                attr_value, max_depth - 1, max_attrs, _seen)
+            if nested:
+                entry["attrs"] = nested
+
+            result[attr_name] = entry
+            count += 1
+
+        _seen.discard(obj_id)
+        return result if result else None
+
     def _track_variables(self, frame, change_line: int):
         """Track variable changes in the current scope."""
         if not self._call_stack:
@@ -155,40 +212,43 @@ class StructuredTracer(Tracer):
                 continue
             val_repr = self._repr(value)
             val_type = type(value).__name__
-            current[key] = (val_repr, val_type)
+            value_data = self._serialize_instance(value)
+            current[key] = (val_repr, val_type, value_data)
 
         prev = self._scope_vars.get(frame_id, {})
 
-        for key, (val_repr, val_type) in current.items():
+        for key, (val_repr, val_type, value_data) in current.items():
             if key not in node["variables"]:
                 # New variable
                 is_arg = key in arg_names
+                history_entry = {
+                    "line": change_line,
+                    "step": self._step,
+                    "action": "arg" if is_arg else "assign",
+                    "value": val_repr,
+                    "value_type": val_type,
+                }
+                if value_data:
+                    history_entry["value_data"] = value_data
                 node["variables"][key] = {
                     "name": key,
                     "type": val_type,
                     "final_value": val_repr,
-                    "history": [
-                        {
-                            "line": change_line,
-                            "step": self._step,
-                            "action": "arg" if is_arg else "assign",
-                            "value": val_repr,
-                            "value_type": val_type,
-                        }
-                    ],
+                    "history": [history_entry],
                 }
             elif key in prev and prev[key][0] != val_repr:
                 # Value changed
-                node["variables"][key]["history"].append(
-                    {
-                        "line": change_line,
-                        "step": self._step,
-                        "action": "modify",
-                        "value": val_repr,
-                        "value_type": val_type,
-                        "old_value": prev[key][0],
-                    }
-                )
+                history_entry = {
+                    "line": change_line,
+                    "step": self._step,
+                    "action": "modify",
+                    "value": val_repr,
+                    "value_type": val_type,
+                    "old_value": prev[key][0],
+                }
+                if value_data:
+                    history_entry["value_data"] = value_data
+                node["variables"][key]["history"].append(history_entry)
                 node["variables"][key]["type"] = val_type
                 node["variables"][key]["final_value"] = val_repr
 

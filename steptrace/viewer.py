@@ -95,9 +95,18 @@ class Viewer:
         self.node = self.root
         self.sel = 0
         self.scroll = 0
-        self.mode = "tree"  # "tree" | "variable"
+        self.mode = "tree"  # "tree" | "variable" | "instance"
         self.cur_var = None
+        self.var_sel = 0
         self.var_scroll = 0
+
+        # Instance inspection state
+        self.instance_stack = []   # [(data, keys, sel, scroll)]
+        self.instance_data = None
+        self.instance_keys = []
+        self.instance_sel = 0
+        self.instance_scroll = 0
+        self.instance_path = []    # [(name, type)] breadcrumb
 
     # ── Item list ───────────────────────────────────────────────────────
 
@@ -115,21 +124,67 @@ class Viewer:
     # ── Navigation ──────────────────────────────────────────────────────
 
     def _enter(self):
-        items = self._items()
-        if not items or self.sel >= len(items):
-            return
-        kind, data = items[self.sel]
-        if kind == "call":
-            self.path_stack.append((self.node, self.sel, self.scroll))
-            self.node = data
-            self.sel = 0
-            self.scroll = 0
-        elif kind == "variable":
-            self.mode = "variable"
-            self.cur_var = data
-            self.var_scroll = 0
+        if self.mode == "tree":
+            items = self._items()
+            if not items or self.sel >= len(items):
+                return
+            kind, data = items[self.sel]
+            if kind == "call":
+                self.path_stack.append((self.node, self.sel, self.scroll))
+                self.node = data
+                self.sel = 0
+                self.scroll = 0
+            elif kind == "variable":
+                self.mode = "variable"
+                self.cur_var = data
+                self.var_sel = 0
+                self.var_scroll = 0
+        elif self.mode == "variable":
+            if self.cur_var:
+                history = self.cur_var.get("history", [])
+                if 0 <= self.var_sel < len(history):
+                    entry = history[self.var_sel]
+                    value_data = entry.get("value_data")
+                    if value_data:
+                        self.mode = "instance"
+                        self.instance_stack = []
+                        self.instance_data = value_data
+                        self.instance_keys = list(value_data.keys())
+                        self.instance_sel = 0
+                        self.instance_scroll = 0
+                        var_name = self.cur_var.get("name", "?")
+                        val_type = entry.get("value_type", "?")
+                        self.instance_path = [(var_name, val_type)]
+        elif self.mode == "instance":
+            if (self.instance_keys
+                    and 0 <= self.instance_sel < len(self.instance_keys)):
+                key = self.instance_keys[self.instance_sel]
+                attr = self.instance_data.get(key, {})
+                nested = attr.get("attrs")
+                if nested:
+                    self.instance_stack.append(
+                        (self.instance_data, self.instance_keys,
+                         self.instance_sel, self.instance_scroll))
+                    self.instance_data = nested
+                    self.instance_keys = list(nested.keys())
+                    self.instance_sel = 0
+                    self.instance_scroll = 0
+                    self.instance_path.append(
+                        (key, attr.get("type", "?")))
 
     def _back(self):
+        if self.mode == "instance":
+            if self.instance_stack:
+                (self.instance_data, self.instance_keys,
+                 self.instance_sel, self.instance_scroll
+                 ) = self.instance_stack.pop()
+                self.instance_path.pop()
+            else:
+                self.mode = "variable"
+                self.instance_data = None
+                self.instance_keys = []
+                self.instance_path = []
+            return
         if self.mode == "variable":
             self.mode = "tree"
             self.cur_var = None
@@ -172,6 +227,8 @@ class Viewer:
 
             if self.mode == "tree":
                 self._draw_tree(stdscr, h, w)
+            elif self.mode == "instance":
+                self._draw_instance(stdscr, h, w)
             else:
                 self._draw_variable(stdscr, h, w)
 
@@ -198,14 +255,24 @@ class Viewer:
 
     def _on_up(self, h):
         if self.mode == "variable":
-            self.var_scroll = max(0, self.var_scroll - 1)
+            if self.var_sel > 0:
+                self.var_sel -= 1
+        elif self.mode == "instance":
+            if self.instance_sel > 0:
+                self.instance_sel -= 1
         else:
             if self.sel > 0:
                 self.sel -= 1
 
     def _on_down(self, h):
         if self.mode == "variable":
-            self.var_scroll += 1
+            if self.cur_var:
+                history = self.cur_var.get("history", [])
+                if self.var_sel < len(history) - 1:
+                    self.var_sel += 1
+        elif self.mode == "instance":
+            if self.instance_sel < len(self.instance_keys) - 1:
+                self.instance_sel += 1
         else:
             items = self._items()
             if self.sel < len(items) - 1:
@@ -213,13 +280,25 @@ class Viewer:
 
     def _go_top(self):
         if self.mode == "variable":
+            self.var_sel = 0
             self.var_scroll = 0
+        elif self.mode == "instance":
+            self.instance_sel = 0
+            self.instance_scroll = 0
         else:
             self.sel = 0
             self.scroll = 0
 
     def _go_bottom(self):
-        if self.mode != "variable":
+        if self.mode == "variable":
+            if self.cur_var:
+                history = self.cur_var.get("history", [])
+                if history:
+                    self.var_sel = len(history) - 1
+        elif self.mode == "instance":
+            if self.instance_keys:
+                self.instance_sel = len(self.instance_keys) - 1
+        else:
             items = self._items()
             if items:
                 self.sel = len(items) - 1
@@ -250,8 +329,10 @@ class Viewer:
         _put(win, row, 0, " " * (w - 1), curses.A_REVERSE)
         if self.mode == "tree":
             txt = " \u2191\u2193/jk Navigate | Enter/\u2192 Open | Esc/\u2190 Back | g/G Top/Bottom | q Quit "
+        elif self.mode == "instance":
+            txt = " \u2191\u2193/jk Navigate | Enter/\u2192 Expand | Esc/\u2190 Back | g/G Top/Bottom | q Quit "
         else:
-            txt = " \u2191\u2193/jk Scroll | Esc/\u2190 Back | q Quit "
+            txt = " \u2191\u2193/jk Navigate | Enter/\u2192 Inspect | Esc/\u2190 Back | g/G Top/Bottom | q Quit "
         _put(win, row, 0, txt, curses.A_REVERSE)
 
     # ── Drawing: tree view ──────────────────────────────────────────────
@@ -486,20 +567,47 @@ class Viewer:
             self._draw_footer(win, h, w)
             return
 
+        # Clamp var_sel
+        if self.var_sel >= len(history):
+            self.var_sel = len(history) - 1
+        if self.var_sel < 0:
+            self.var_sel = 0
+
         content_top = row
         content_h = h - content_top - 1
 
-        # Clamp var_scroll
-        max_scroll = max(0, len(history) * 2 - content_h)
-        if self.var_scroll > max_scroll:
-            self.var_scroll = max_scroll
+        # Compute line offsets per entry for scroll management
+        total_lines = 0
+        sel_line_start = 0
+        sel_line_end = 0
+        for i, entry in enumerate(history):
+            if i == self.var_sel:
+                sel_line_start = total_lines
+            lines = 1
+            if (entry.get("old_value")
+                    and entry.get("action", "").upper() == "MODIFY"):
+                lines += 1
+            total_lines += lines
+            if i == self.var_sel:
+                sel_line_end = total_lines
+
+        # Adjust scroll to keep selected entry visible
+        if sel_line_start < self.var_scroll:
+            self.var_scroll = sel_line_start
+        if sel_line_end > self.var_scroll + content_h:
+            self.var_scroll = sel_line_end - content_h
+        max_scroll = max(0, total_lines - content_h)
+        self.var_scroll = max(0, min(self.var_scroll, max_scroll))
 
         drawn = 0
-        logical_row = 0  # counts rendered lines across all entries
+        logical_row = 0
 
-        for entry in history:
+        for i, entry in enumerate(history):
             if drawn >= content_h:
                 break
+
+            is_sel = (i == self.var_sel)
+            has_data = bool(entry.get("value_data"))
 
             line_no = entry.get("line", "?")
             step = entry.get("step", "?")
@@ -528,28 +636,40 @@ class Viewer:
             # Main line
             if logical_row >= self.var_scroll:
                 y = content_top + drawn
+                sel_attr = curses.A_REVERSE if is_sel else 0
+
+                if is_sel:
+                    _put(win, y, 0, " " * (w - 1), sel_attr)
 
                 info = f"  {str(step):<6}| {str(line_no):<6}| "
                 _put(win, y, 0, info,
-                     curses.color_pair(C_TYPE) | curses.A_DIM)
+                     curses.color_pair(C_TYPE) | curses.A_DIM | sel_attr)
                 off = len(info)
 
                 _put(win, y, off, a_label,
-                     curses.color_pair(a_color) | curses.A_BOLD)
+                     curses.color_pair(a_color) | curses.A_BOLD | sel_attr)
                 off += len(a_label)
 
                 if action != "DELETE":
                     val_display = f"| {name} = {value}"
-                    avail = w - off - 15
+                    reserve = 15 + (4 if has_data else 0)
+                    avail = w - off - reserve
                     if avail > 3 and len(val_display) > avail:
                         val_display = val_display[: avail - 3] + "..."
                     _put(win, y, off, val_display,
-                         curses.color_pair(C_VALUE))
-                    off += min(len(val_display), w - off - 2)
+                         curses.color_pair(C_VALUE) | sel_attr)
+                    off += min(len(val_display), w - off - 8)
 
                     type_tag = f"  ({val_type})"
                     _put(win, y, off, type_tag,
-                         curses.color_pair(C_TYPE) | curses.A_DIM)
+                         curses.color_pair(C_TYPE) | curses.A_DIM | sel_attr)
+                    off += len(type_tag)
+
+                    # Expand indicator for class instances
+                    if has_data:
+                        _put(win, y, off + 1, "\u25b6",
+                             curses.color_pair(C_FUNC) | curses.A_BOLD
+                             | sel_attr)
 
                 drawn += 1
 
@@ -559,14 +679,128 @@ class Viewer:
             if old_value and action == "MODIFY":
                 if logical_row >= self.var_scroll and drawn < content_h:
                     y = content_top + drawn
+                    sel_attr = curses.A_REVERSE if is_sel else 0
+                    if is_sel:
+                        _put(win, y, 0, " " * (w - 1), sel_attr)
                     pad = "        " + " " * 8
                     old_str = f"{pad}  was: {old_value}"
                     if len(old_str) > w - 2:
                         old_str = old_str[: w - 5] + "..."
                     _put(win, y, 0, old_str,
-                         curses.color_pair(C_CHANGE) | curses.A_DIM)
+                         curses.color_pair(C_CHANGE) | curses.A_DIM
+                         | sel_attr)
                     drawn += 1
                 logical_row += 1
+
+        self._draw_footer(win, h, w)
+
+
+    # ── Drawing: instance inspection view ──────────────────────────────
+
+    def _draw_instance(self, win, h, w):
+        row = self._draw_header(win, h, w)
+
+        # Instance path breadcrumb
+        if self.instance_path:
+            path_str = ".".join(n for n, _ in self.instance_path)
+            cur_type = self.instance_path[-1][1]
+        else:
+            path_str = "?"
+            cur_type = "?"
+
+        _put(win, row, 1, "Instance: ",
+             curses.color_pair(C_TYPE))
+        _put(win, row, 11, path_str,
+             curses.color_pair(C_VAR) | curses.A_BOLD)
+        _put(win, row, 11 + len(path_str), f"  ({cur_type})",
+             curses.color_pair(C_TYPE) | curses.A_DIM)
+        row += 1
+
+        # Context breadcrumb
+        _put(win, row, 1, "in: ",
+             curses.color_pair(C_TYPE) | curses.A_DIM)
+        _put(win, row, 5, self._breadcrumb(),
+             curses.color_pair(C_PATH) | curses.A_DIM)
+        row += 1
+        _hline(win, row, w)
+        row += 1
+
+        # Column header
+        _put(win, row, 0, "  Attribute",
+             curses.color_pair(C_HEADER) | curses.A_BOLD)
+        row += 1
+        _hline(win, row, w, "\u2500")
+        row += 1
+
+        keys = self.instance_keys
+        if not keys:
+            _put(win, row + 1, 3, "No attributes found.",
+                 curses.color_pair(C_TYPE) | curses.A_DIM)
+            self._draw_footer(win, h, w)
+            return
+
+        # Clamp selection
+        if self.instance_sel >= len(keys):
+            self.instance_sel = len(keys) - 1
+        if self.instance_sel < 0:
+            self.instance_sel = 0
+
+        content_top = row
+        content_h = h - content_top - 1
+
+        # Adjust scroll
+        if self.instance_sel < self.instance_scroll:
+            self.instance_scroll = self.instance_sel
+        if self.instance_sel >= self.instance_scroll + content_h:
+            self.instance_scroll = self.instance_sel - content_h + 1
+
+        drawn = 0
+        for i in range(self.instance_scroll, len(keys)):
+            if drawn >= content_h:
+                break
+            y = content_top + drawn
+            key = keys[i]
+            attr = self.instance_data.get(key, {})
+            is_sel = (i == self.instance_sel)
+            has_children = bool(attr.get("attrs"))
+
+            sel_attr = curses.A_REVERSE if is_sel else 0
+            if is_sel:
+                _put(win, y, 0, " " * (w - 1), sel_attr)
+
+            prefix = " \u25b6 " if is_sel else "   "
+            _put(win, y, 0, prefix, sel_attr)
+            off = len(prefix)
+
+            # Attribute name
+            _put(win, y, off, key,
+                 curses.color_pair(C_VAR) | curses.A_BOLD | sel_attr)
+            off += len(key)
+
+            # Type
+            type_str = f" ({attr.get('type', '?')})"
+            _put(win, y, off, type_str,
+                 curses.color_pair(C_TYPE) | curses.A_DIM | sel_attr)
+            off += len(type_str)
+
+            # Value
+            val = attr.get("value", "?")
+            val_str = f" = {val}"
+            reserve = 4 if has_children else 1
+            avail = w - off - reserve
+            if avail > 3:
+                if len(val_str) > avail:
+                    val_str = val_str[: avail - 3] + "..."
+                _put(win, y, off, val_str,
+                     curses.color_pair(C_VALUE) | sel_attr)
+                off += min(len(val_str), w - off - reserve)
+
+            # Expand indicator for nested instances
+            if has_children:
+                _put(win, y, off + 1, "\u25b6",
+                     curses.color_pair(C_FUNC) | curses.A_BOLD | sel_attr)
+
+            drawn += 1
 
         self._draw_footer(win, h, w)
 

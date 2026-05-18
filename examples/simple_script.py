@@ -26,6 +26,53 @@ def process_list(items):
     return total
 
 
+class Vector2D:
+    """A 2D vector."""
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def __repr__(self):
+        return f"Vector2D({self.x}, {self.y})"
+
+
+class Weapon:
+    """A weapon with stats."""
+    def __init__(self, name, damage):
+        self.name = name
+        self.damage = damage
+
+    def __repr__(self):
+        return f"Weapon({self.name!r}, dmg={self.damage})"
+
+
+class Sprite:
+    """A game sprite with nested objects."""
+    def __init__(self, name, x, y, weapon_name="sword", weapon_dmg=10):
+        self.name = name
+        self.position = Vector2D(x, y)
+        self.health = 100
+        self.weapon = Weapon(weapon_name, weapon_dmg)
+
+    def move(self, dx, dy):
+        self.position.x += dx
+        self.position.y += dy
+
+    def __repr__(self):
+        return f"Sprite({self.name!r}, pos={self.position})"
+
+
+def game_step():
+    """Simulate a game step with class instances."""
+    player = Sprite("hero", 0, 0, "excalibur", 50)
+    enemy = Sprite("goblin", 10, 5, "club", 5)
+    player.move(3, 4)
+    enemy.health -= player.weapon.damage
+    print(f"Player: {player}")
+    print(f"Enemy health: {enemy.health}")
+    return player
+
+
 def main():
     """Main function."""
     print("Simple script starting...")
@@ -38,6 +85,11 @@ def main():
     items = [1, 2, 3, 4, 5]
     result = process_list(items)
     print(f"process_list({items}) = {result}")
+    
+    game_step()
+
+    import numpy as np
+    x = np.zeros((100, 100))
     
     print("Simple script done!")
     return 0
