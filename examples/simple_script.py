@@ -27,10 +27,14 @@ def process_list(items):
 
 
 class Vector2D:
-    """A 2D vector."""
+    """A 2D vector with a computed @property."""
     def __init__(self, x, y):
         self.x = x
         self.y = y
+
+    @property
+    def magnitude(self):
+        return (self.x ** 2 + self.y ** 2) ** 0.5
 
     def __repr__(self):
         return f"Vector2D({self.x}, {self.y})"
@@ -47,12 +51,16 @@ class Weapon:
 
 
 class Sprite:
-    """A game sprite with nested objects."""
+    """A game sprite with nested objects and @property."""
     def __init__(self, name, x, y, weapon_name="sword", weapon_dmg=10):
         self.name = name
         self.position = Vector2D(x, y)
         self.health = 100
         self.weapon = Weapon(weapon_name, weapon_dmg)
+
+    @property
+    def is_alive(self):
+        return self.health > 0
 
     def move(self, dx, dy):
         self.position.x += dx
@@ -69,7 +77,7 @@ def game_step():
     player.move(3, 4)
     enemy.health -= player.weapon.damage
     print(f"Player: {player}")
-    print(f"Enemy health: {enemy.health}")
+    print(f"Enemy health: {enemy.health}, alive: {enemy.is_alive}")
     return player
 
 

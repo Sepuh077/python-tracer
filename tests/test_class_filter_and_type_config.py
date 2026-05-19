@@ -578,6 +578,411 @@ def test_type_config_cli_bad_file():
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  3. Class body variable leak prevention
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_class_body_vars_not_leaked():
+    """Property/staticmethod descriptors from class bodies must not leak
+    into the parent scope's variable tracking."""
+
+    def run():
+        class Widget:
+            kind = "button"
+
+            @property
+            def label(self):
+                return self.kind.upper()
+
+            @staticmethod
+            def default():
+                return Widget("ok")
+
+            def __init__(self, name="x"):
+                self.name = name
+
+        w = Widget("save")
+        _ = w.label
+
+    tree = _trace_and_load(run)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var_names = [v["name"] for v in run_nodes[0].get("variables", [])]
+    # Only real locals (w, _) should appear, not class body names
+    for bad in ("label", "default", "kind"):
+        assert bad not in var_names, (
+            f"Class body variable '{bad}' leaked into run() scope. "
+            f"Variables: {var_names}"
+        )
+    assert "w" in var_names, f"Real variable 'w' should be tracked. Got: {var_names}"
+    print("  pass test_class_body_vars_not_leaked")
+
+
+def test_class_body_vars_not_leaked_via_cli():
+    """Class body variables should not leak when running via CLI --export."""
+    test_dir = tempfile.mkdtemp(prefix="steptrace_test_leak_cli_")
+    try:
+        script = os.path.join(test_dir, "leak_test.py")
+        with open(script, "w") as f:
+            f.write("""
+class Gadget:
+    tag = "gadget"
+
+    @property
+    def info(self):
+        return self.tag
+
+def main():
+    g = Gadget()
+    return g.info
+
+main()
+""")
+        export = os.path.join(test_dir, "trace.json")
+        result = subprocess.run(
+            [sys.executable, "-m", "steptrace", "run", script, "--export", export],
+            capture_output=True, text=True, cwd=get_project_root(),
+        )
+        assert result.returncode == 0, f"CLI failed: {result.stderr}"
+
+        with open(export) as f:
+            data = json.load(f)
+
+        root = data["call_tree"]
+        # Module-level variables should not include class body descriptors
+        root_var_names = [v["name"] for v in root.get("variables", [])]
+        for bad in ("info", "tag"):
+            assert bad not in root_var_names, (
+                f"Class body variable '{bad}' leaked to module scope: {root_var_names}"
+            )
+
+        print("  pass test_class_body_vars_not_leaked_via_cli")
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  4. Name-based type config matching (exec'd script classes)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_type_config_name_matching_via_cli():
+    """Type config should match user-defined classes by name when running
+    via CLI (where isinstance fails because exec creates a new class)."""
+    test_dir = tempfile.mkdtemp(prefix="steptrace_test_name_match_")
+    try:
+        script = os.path.join(test_dir, "sensor.py")
+        with open(script, "w") as f:
+            f.write("""
+class Sensor:
+    def __init__(self, name, val):
+        self.name = name
+        self._val = val
+
+    @property
+    def reading(self):
+        return self._val * 2
+
+def main():
+    s = Sensor('temp', 21)
+    r = s.reading
+    return r
+
+main()
+""")
+        cfg = os.path.join(test_dir, "tc.py")
+        with open(cfg, "w") as f:
+            # Define a *separate* class with the same name – isinstance
+            # will fail, but name-based matching should kick in.
+            f.write(
+                "class Sensor:\n"
+                "    pass\n"
+                'CONFIG = {Sensor: ["reading"]}\n'
+            )
+
+        export = os.path.join(test_dir, "trace.json")
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "steptrace", "run", script,
+                "--export", export, "--type-config", cfg,
+            ],
+            capture_output=True, text=True, cwd=get_project_root(),
+        )
+        assert result.returncode == 0, f"CLI failed: {result.stderr}"
+
+        with open(export) as f:
+            data = json.load(f)
+
+        main_nodes = _find_nodes(data["call_tree"], "main")
+        assert len(main_nodes) == 1
+
+        var = _find_variable(main_nodes[0], "s")
+        assert var is not None, "Variable 's' should be tracked"
+
+        found_reading = False
+        for h in var.get("history", []):
+            vd = h.get("value_data")
+            if vd and "reading" in vd:
+                found_reading = True
+                assert vd["reading"]["value"] == "42"
+                assert vd["reading"]["type"] == "int"
+
+        assert found_reading, (
+            "reading property should appear in value_data via name matching"
+        )
+        print("  pass test_type_config_name_matching_via_cli")
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  5. Function tracking (calling methods listed in type config)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_function_tracking_ndarray_sum():
+    """np.ndarray: ['shape', 'sum'] should track shape as attribute and
+    call sum() as a function, recording its return value."""
+    import numpy as np
+
+    type_config = {np.ndarray: ["shape", "sum"]}
+
+    def run():
+        arr = np.array([[1, 2, 3], [4, 5, 6]])
+        _ = arr.sum()
+
+    tree = _trace_and_load(run, type_config=type_config)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var = _find_variable(run_nodes[0], "arr")
+    assert var is not None
+
+    found = False
+    for h in var.get("history", []):
+        vd = h.get("value_data")
+        if vd and "shape" in vd and "sum" in vd:
+            found = True
+            assert vd["shape"]["value"] == "(2, 3)"
+            # sum() should be called and return 21
+            assert "21" in vd["sum"]["value"]
+            # Function results should carry source=function
+            assert vd["sum"].get("source") == "function"
+            # shape is NOT a function (it's a property), no source field
+            assert vd["shape"].get("source") is None
+
+    assert found, "shape and sum should both appear in value_data"
+    print("  pass test_function_tracking_ndarray_sum")
+
+
+def test_function_tracking_custom_class():
+    """Custom class methods listed in type config should be called."""
+
+    class Stats:
+        def __init__(self, values):
+            self.values = values
+
+        def mean(self):
+            return sum(self.values) / len(self.values)
+
+        def total(self):
+            return sum(self.values)
+
+    type_config = {Stats: ["mean", "total"]}
+
+    def run():
+        s = Stats([10, 20, 30])
+        _ = s
+
+    tree = _trace_and_load(run, type_config=type_config)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var = _find_variable(run_nodes[0], "s")
+    assert var is not None
+
+    found = False
+    for h in var.get("history", []):
+        vd = h.get("value_data")
+        if vd and "mean" in vd and "total" in vd:
+            found = True
+            assert vd["mean"]["value"] == "20.0"
+            assert vd["total"]["value"] == "60"
+            assert vd["mean"].get("source") == "function"
+            assert vd["total"].get("source") == "function"
+            # __dict__ attribute 'values' should also be present
+            assert "values" in vd
+
+    assert found, "mean and total should appear in value_data"
+    print("  pass test_function_tracking_custom_class")
+
+
+def test_function_tracking_method_with_args_skipped():
+    """Methods that require arguments should be silently skipped."""
+
+    class Container:
+        def __init__(self):
+            self.items = [1, 2, 3]
+
+        def get(self, index):
+            return self.items[index]
+
+    type_config = {Container: ["get"]}
+
+    def run():
+        c = Container()
+        _ = c
+
+    tree = _trace_and_load(run, type_config=type_config)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var = _find_variable(run_nodes[0], "c")
+    assert var is not None
+
+    for h in var.get("history", []):
+        vd = h.get("value_data")
+        if vd:
+            # 'get' requires an argument and should be skipped
+            assert "get" not in vd, (
+                f"Method requiring args should be skipped, got: {vd.keys()}"
+            )
+            # 'items' from __dict__ should still be present
+            assert "items" in vd
+
+    print("  pass test_function_tracking_method_with_args_skipped")
+
+
+def test_function_tracking_via_cli():
+    """Function tracking should work end-to-end via CLI --type-config."""
+    import numpy as np
+
+    test_dir = tempfile.mkdtemp(prefix="steptrace_test_func_cli_")
+    try:
+        script = os.path.join(test_dir, "arr_script.py")
+        with open(script, "w") as f:
+            f.write(
+                "import numpy as np\n"
+                "def main():\n"
+                "    arr = np.ones((3, 4))\n"
+                "    return arr\n"
+                "main()\n"
+            )
+
+        cfg = os.path.join(test_dir, "tc.py")
+        with open(cfg, "w") as f:
+            f.write(
+                "import numpy as np\n"
+                'CONFIG = {np.ndarray: ["shape", "sum"]}\n'
+            )
+
+        export = os.path.join(test_dir, "trace.json")
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "steptrace", "run", script,
+                "--export", export, "--type-config", cfg,
+            ],
+            capture_output=True, text=True, cwd=get_project_root(),
+        )
+        assert result.returncode == 0, f"CLI failed: {result.stderr}"
+
+        with open(export) as f:
+            data = json.load(f)
+
+        main_nodes = _find_nodes(data["call_tree"], "main")
+        assert len(main_nodes) == 1
+
+        var = _find_variable(main_nodes[0], "arr")
+        assert var is not None
+
+        found = False
+        for h in var.get("history", []):
+            vd = h.get("value_data")
+            if vd and "shape" in vd and "sum" in vd:
+                found = True
+                assert vd["shape"]["value"] == "(3, 4)"
+                # sum of ones(3,4) = 12.0
+                assert "12" in vd["sum"]["value"]
+                assert vd["sum"].get("source") == "function"
+
+        assert found, "shape and sum should be in value_data via CLI"
+        print("  pass test_function_tracking_via_cli")
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  6. Config tracking for types without __dict__
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_config_attrs_without_dict():
+    """Config entries should be tracked for objects even when __dict__
+    is empty or doesn't contain the configured attributes."""
+    import numpy as np
+
+    # ndarray has an empty __dict__ — shape/dtype/sum come from C slots
+    type_config = {np.ndarray: ["shape", "dtype", "sum"]}
+
+    def run():
+        arr = np.zeros((5, 3), dtype=np.float32)
+        _ = arr
+
+    tree = _trace_and_load(run, type_config=type_config)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var = _find_variable(run_nodes[0], "arr")
+    assert var is not None
+
+    found = False
+    for h in var.get("history", []):
+        vd = h.get("value_data")
+        if vd:
+            found = True
+            assert "shape" in vd, f"shape missing, keys: {list(vd.keys())}"
+            assert "dtype" in vd, f"dtype missing, keys: {list(vd.keys())}"
+            assert "sum" in vd, f"sum missing, keys: {list(vd.keys())}"
+            assert vd["shape"]["value"] == "(5, 3)"
+            assert vd["sum"].get("source") == "function"
+
+    assert found, "value_data should exist with config entries despite empty __dict__"
+    print("  pass test_config_attrs_without_dict")
+
+
+def test_config_tracks_on_modification():
+    """Config properties should be tracked on every modification, not just
+    the initial assignment."""
+    import numpy as np
+
+    type_config = {np.ndarray: ["shape", "sum"]}
+
+    def run():
+        arr = np.zeros((2, 3))
+        arr = np.ones((4, 5))
+        _ = arr
+
+    tree = _trace_and_load(run, type_config=type_config)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var = _find_variable(run_nodes[0], "arr")
+    assert var is not None
+
+    # Should have two history entries: assign and modify
+    shapes = []
+    for h in var.get("history", []):
+        vd = h.get("value_data")
+        if vd and "shape" in vd:
+            shapes.append(vd["shape"]["value"])
+
+    assert "(2, 3)" in shapes, f"Initial shape missing. Got: {shapes}"
+    assert "(4, 5)" in shapes, f"Modified shape missing. Got: {shapes}"
+    print("  pass test_config_tracks_on_modification")
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 
@@ -609,6 +1014,23 @@ if __name__ == "__main__":
     # Type config via CLI
     test_type_config_via_cli()
     test_type_config_cli_bad_file()
+
+    # Class body variable leak prevention
+    test_class_body_vars_not_leaked()
+    test_class_body_vars_not_leaked_via_cli()
+
+    # Name-based type config matching
+    test_type_config_name_matching_via_cli()
+
+    # Function tracking
+    test_function_tracking_ndarray_sum()
+    test_function_tracking_custom_class()
+    test_function_tracking_method_with_args_skipped()
+    test_function_tracking_via_cli()
+
+    # Config tracking without __dict__
+    test_config_attrs_without_dict()
+    test_config_tracks_on_modification()
 
     print("=" * 55)
     print("All class filter + type config tests passed!")

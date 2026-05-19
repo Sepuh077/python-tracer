@@ -70,6 +70,9 @@ _SKIP_VAR_TYPES = (
     types.MethodType,
     types.ModuleType,
     type,
+    property,
+    classmethod,
+    staticmethod,
 )
 
 # Basic/primitive types whose __dict__ should not be inspected
@@ -184,13 +187,24 @@ class StructuredTracer(Tracer):
     def _get_type_config_props(self, value):
         """Return the list of property names to export for *value*'s type.
 
-        Checks both exact type match and ``isinstance`` so that sub-classes
-        also benefit from a parent-class config entry.
+        Checks exact ``isinstance`` first (works for shared types like
+        numpy), then falls back to matching by class ``__name__`` so that
+        user-defined classes in exec'd scripts (CLI ``--export``) are also
+        matched even though the type object in the config file and the one
+        created by ``exec()`` are distinct objects.
         """
+        value_type_name = type(value).__name__
+        name_match = None
         for typ, props in self._type_config.items():
-            if isinstance(value, typ):
-                return props
-        return []
+            try:
+                if isinstance(value, typ):
+                    return props
+            except TypeError:
+                pass
+            # Collect first name-based match as fallback
+            if name_match is None and getattr(typ, '__name__', None) == value_type_name:
+                name_match = props
+        return name_match if name_match is not None else []
 
     def _serialize_instance(self, value, max_depth=4, max_attrs=50, _seen=None):
         """Serialize a class instance's attributes for inspection.
@@ -248,7 +262,7 @@ class StructuredTracer(Tracer):
                 result[attr_name] = entry
                 count += 1
 
-        # ---- Type-config extra properties ----
+        # ---- Type-config extra properties / functions ----
         for prop_name in extra_props:
             if prop_name in result:
                 continue  # already covered by __dict__
@@ -256,13 +270,23 @@ class StructuredTracer(Tracer):
                 prop_value = getattr(value, prop_name)
             except Exception:
                 continue
-            # Skip callable results (methods, bound functions, etc.)
-            if callable(prop_value) and not isinstance(prop_value, _BASIC_TYPES):
-                continue
+            # If the attribute is callable (a method), invoke it with no
+            # arguments and record the return value.  This lets users
+            # track e.g. ``np.ndarray: ["shape", "sum"]`` where ``sum``
+            # is called as ``arr.sum()`` and the result is stored.
+            is_function = callable(prop_value) and not isinstance(
+                prop_value, _BASIC_TYPES)
+            if is_function:
+                try:
+                    prop_value = prop_value()
+                except Exception:
+                    continue
             entry = {
                 "value": self._repr(prop_value, max_len=200),
                 "type": type(prop_value).__name__,
             }
+            if is_function:
+                entry["source"] = "function"
             nested = self._serialize_instance(
                 prop_value, max_depth - 1, max_attrs, _seen)
             if nested:
@@ -493,6 +517,13 @@ class StructuredTracer(Tracer):
 
             elif event == "line":
                 if not self._is_tracable_func(func_name):
+                    self._timer = time.perf_counter()
+                    return self._run_tracer
+
+                # Skip class body lines – their locals (property /
+                # staticmethod descriptors, etc.) must not leak into
+                # the parent scope's variable tracking.
+                if self._is_class_body(frame):
                     self._timer = time.perf_counter()
                     return self._run_tracer
 

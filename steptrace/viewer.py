@@ -772,10 +772,12 @@ class Viewer:
             _put(win, y, 0, prefix, sel_attr)
             off = len(prefix)
 
-            # Attribute name
-            _put(win, y, off, key,
+            # Attribute name (append "()" for function-sourced values)
+            source = attr.get("source", "")
+            display_key = f"{key}()" if source == "function" else key
+            _put(win, y, off, display_key,
                  curses.color_pair(C_VAR) | curses.A_BOLD | sel_attr)
-            off += len(key)
+            off += len(display_key)
 
             # Type
             type_str = f" ({attr.get('type', '?')})"
