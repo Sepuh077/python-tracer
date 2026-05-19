@@ -24,44 +24,6 @@ from typing import Dict, List, Optional
 
 from .tracer import LogLevel, LogOutput, Tracer
 
-# ── Type config loader ──────────────────────────────────────────────────────
-
-def load_type_config(filepath: str) -> dict:
-    """Load a Python type config file and return the CONFIG mapping.
-
-    The file must define a top-level ``CONFIG`` dict that maps types to
-    property names (a single string) or lists of property names.  Example::
-
-        import numpy as np
-        CONFIG = {
-            np.ndarray: "shape",
-        }
-
-    Returns:
-        A dict mapping each type to a **list** of property name strings.
-    """
-    import importlib.util
-
-    filepath = os.path.abspath(filepath)
-    spec = importlib.util.spec_from_file_location("_steptrace_type_config", filepath)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    raw = getattr(mod, "CONFIG", None)
-    if raw is None:
-        raise ValueError(f"Type config file {filepath} must define a CONFIG dict")
-    if not isinstance(raw, dict):
-        raise TypeError(f"CONFIG in {filepath} must be a dict, got {type(raw).__name__}")
-
-    # Normalise: single string → one-element list
-    normalised: dict = {}
-    for typ, props in raw.items():
-        if isinstance(props, str):
-            props = [props]
-        normalised[typ] = list(props)
-    return normalised
-
-
 # Types to skip when tracking variables (we only want data, not code objects)
 _SKIP_VAR_TYPES = (
     types.FunctionType,
@@ -187,24 +149,62 @@ class StructuredTracer(Tracer):
     def _get_type_config_props(self, value):
         """Return the list of property names to export for *value*'s type.
 
-        Checks exact ``isinstance`` first (works for shared types like
-        numpy), then falls back to matching by class ``__name__`` so that
-        user-defined classes in exec'd scripts (CLI ``--export``) are also
-        matched even though the type object in the config file and the one
-        created by ``exec()`` are distinct objects.
+        Supports two key formats in ``_type_config``:
+
+        1. **Type objects** (programmatic API) – checked via ``isinstance``
+           first, then by ``__name__`` as a fallback for exec'd scripts.
+        2. **String keys** (TOML config) – matched against the class name
+           and MRO.  A dotted key like ``"numpy.ndarray"`` is compared
+           against ``module.qualname``; a plain key like ``"Vector2D"``
+           matches any class with that ``__name__``.
         """
-        value_type_name = type(value).__name__
+        value_type = type(value)
+        value_type_name = value_type.__name__
+        value_module = getattr(value_type, '__module__', '') or ''
+        value_qualname = getattr(value_type, '__qualname__', value_type_name)
+
         name_match = None
-        for typ, props in self._type_config.items():
-            try:
-                if isinstance(value, typ):
+
+        for key, props in self._type_config.items():
+            if isinstance(key, type):
+                # ── Type-object key (programmatic API) ──
+                try:
+                    if isinstance(value, key):
+                        return props
+                except TypeError:
+                    pass
+                if name_match is None and getattr(key, '__name__', None) == value_type_name:
+                    name_match = props
+
+            elif isinstance(key, str):
+                # ── String key (TOML config) ──
+                if self._matches_type_key(key, value_type):
                     return props
-            except TypeError:
-                pass
-            # Collect first name-based match as fallback
-            if name_match is None and getattr(typ, '__name__', None) == value_type_name:
-                name_match = props
+
         return name_match if name_match is not None else []
+
+    @staticmethod
+    def _matches_type_key(key: str, cls: type) -> bool:
+        """Check whether a string type-config key matches *cls* or any of
+        its bases (MRO), supporting both simple names and module-qualified
+        dotted names.
+        """
+        for base in cls.__mro__:
+            base_name = base.__name__
+            base_qualname = getattr(base, '__qualname__', base_name)
+            base_module = getattr(base, '__module__', '') or ''
+
+            if "." in key:
+                # Module-qualified key – compare against "module.qualname"
+                full = f"{base_module}.{base_qualname}" if base_module else base_qualname
+                if full == key or full.endswith(f".{key}"):
+                    return True
+            else:
+                # Simple name key – match __name__ or __qualname__
+                if base_name == key or base_qualname == key:
+                    return True
+
+        return False
 
     def _serialize_instance(self, value, max_depth=4, max_attrs=50, _seen=None):
         """Serialize a class instance's attributes for inspection.

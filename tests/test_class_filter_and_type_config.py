@@ -17,7 +17,7 @@ import tempfile
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from steptrace.structured_tracer import StructuredTracer, load_type_config
+from steptrace.structured_tracer import StructuredTracer
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -210,7 +210,7 @@ main()
 """)
         export = os.path.join(test_dir, "trace.json")
         result = subprocess.run(
-            [sys.executable, "-m", "steptrace", "run", script, "--export", export],
+            [sys.executable, "-m", "steptrace", "run", script, "-o", export],
             capture_output=True, text=True, cwd=get_project_root(),
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
@@ -262,81 +262,8 @@ def test_inheritance_class_bodies_filtered():
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  2. Type config tests
+#  2. Type config tests (using string-based keys, matching TOML format)
 # ══════════════════════════════════════════════════════════════════════
-
-
-def test_load_type_config_single_string():
-    """load_type_config should normalise a single string to a list."""
-    import numpy as np
-
-    cfg_dir = tempfile.mkdtemp(prefix="steptrace_test_tc_")
-    try:
-        cfg_path = os.path.join(cfg_dir, "tc.py")
-        with open(cfg_path, "w") as f:
-            f.write("import numpy as np\nCONFIG = {np.ndarray: 'shape'}\n")
-
-        result = load_type_config(cfg_path)
-        assert np.ndarray in result
-        assert result[np.ndarray] == ["shape"]
-        print("  pass test_load_type_config_single_string")
-    finally:
-        shutil.rmtree(cfg_dir, ignore_errors=True)
-
-
-def test_load_type_config_list():
-    """load_type_config should keep lists as-is."""
-    import numpy as np
-
-    cfg_dir = tempfile.mkdtemp(prefix="steptrace_test_tc_")
-    try:
-        cfg_path = os.path.join(cfg_dir, "tc.py")
-        with open(cfg_path, "w") as f:
-            f.write(
-                "import numpy as np\n"
-                "CONFIG = {np.ndarray: ['shape', 'dtype', 'size']}\n"
-            )
-        result = load_type_config(cfg_path)
-        assert result[np.ndarray] == ["shape", "dtype", "size"]
-        print("  pass test_load_type_config_list")
-    finally:
-        shutil.rmtree(cfg_dir, ignore_errors=True)
-
-
-def test_load_type_config_missing_config_raises():
-    """load_type_config should raise if CONFIG is missing."""
-    cfg_dir = tempfile.mkdtemp(prefix="steptrace_test_tc_")
-    try:
-        cfg_path = os.path.join(cfg_dir, "bad.py")
-        with open(cfg_path, "w") as f:
-            f.write("X = 1\n")  # no CONFIG
-
-        try:
-            load_type_config(cfg_path)
-            assert False, "Should have raised ValueError"
-        except ValueError:
-            pass
-        print("  pass test_load_type_config_missing_config_raises")
-    finally:
-        shutil.rmtree(cfg_dir, ignore_errors=True)
-
-
-def test_load_type_config_bad_type_raises():
-    """load_type_config should raise if CONFIG is not a dict."""
-    cfg_dir = tempfile.mkdtemp(prefix="steptrace_test_tc_")
-    try:
-        cfg_path = os.path.join(cfg_dir, "bad.py")
-        with open(cfg_path, "w") as f:
-            f.write("CONFIG = [1, 2, 3]\n")
-
-        try:
-            load_type_config(cfg_path)
-            assert False, "Should have raised TypeError"
-        except TypeError:
-            pass
-        print("  pass test_load_type_config_bad_type_raises")
-    finally:
-        shutil.rmtree(cfg_dir, ignore_errors=True)
 
 
 def test_type_config_numpy_shape_exported():
@@ -496,18 +423,139 @@ def test_type_config_subclass_inherits():
     print("  pass test_type_config_subclass_inherits")
 
 
-def test_type_config_via_cli():
-    """--type-config CLI option should work end-to-end."""
+def test_string_type_config_simple_name():
+    """String-based type config (TOML format) should match by class name."""
+    import numpy as np
+
+    # Use string key instead of type object (mirrors TOML config)
+    type_config = {"ndarray": ["shape"]}
+
+    def run():
+        arr = np.zeros((3, 4))
+        _ = arr.shape
+
+    tree = _trace_and_load(run, type_config=type_config)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var = _find_variable(run_nodes[0], "arr")
+    assert var is not None
+
+    found = False
+    for h in var.get("history", []):
+        vd = h.get("value_data")
+        if vd and "shape" in vd:
+            found = True
+            assert vd["shape"]["value"] == "(3, 4)"
+
+    assert found, "shape should be found via string-key type config"
+    print("  pass test_string_type_config_simple_name")
+
+
+def test_string_type_config_module_qualified():
+    """Module-qualified string key like 'numpy.ndarray' should match."""
+    import numpy as np
+
+    type_config = {"numpy.ndarray": ["shape", "dtype"]}
+
+    def run():
+        arr = np.ones((2, 3))
+        _ = arr
+
+    tree = _trace_and_load(run, type_config=type_config)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var = _find_variable(run_nodes[0], "arr")
+    assert var is not None
+
+    found = False
+    for h in var.get("history", []):
+        vd = h.get("value_data")
+        if vd and "shape" in vd:
+            found = True
+            assert vd["shape"]["value"] == "(2, 3)"
+            assert "dtype" in vd
+
+    assert found, "Module-qualified key should match numpy.ndarray"
+    print("  pass test_string_type_config_module_qualified")
+
+
+def test_string_type_config_inheritance():
+    """String key for parent class should match subclasses via MRO."""
+    import numpy as np
+
+    # np.matrix is a subclass of ndarray
+    type_config = {"numpy.ndarray": ["shape"]}
+
+    def run():
+        m = np.matrix([[1, 2], [3, 4]])
+        _ = m
+
+    tree = _trace_and_load(run, type_config=type_config)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var = _find_variable(run_nodes[0], "m")
+    assert var is not None
+
+    found = False
+    for h in var.get("history", []):
+        vd = h.get("value_data")
+        if vd and "shape" in vd:
+            found = True
+            assert vd["shape"]["value"] == "(2, 2)"
+
+    assert found, "String key should match subclass via MRO"
+    print("  pass test_string_type_config_inheritance")
+
+
+def test_string_type_config_custom_class():
+    """String-based type config should work for custom classes."""
+
+    class Wallet:
+        def __init__(self, balance):
+            self.balance = balance
+
+        @property
+        def is_empty(self):
+            return self.balance <= 0
+
+    type_config = {"Wallet": ["is_empty"]}
+
+    def run():
+        w = Wallet(100)
+        _ = w.is_empty
+
+    tree = _trace_and_load(run, type_config=type_config)
+    run_nodes = _find_nodes(tree, "run")
+    assert len(run_nodes) == 1
+
+    var = _find_variable(run_nodes[0], "w")
+    assert var is not None
+
+    found = False
+    for h in var.get("history", []):
+        vd = h.get("value_data")
+        if vd and "is_empty" in vd:
+            found = True
+            assert vd["is_empty"]["value"] == "False"
+            assert "balance" in vd  # from __dict__
+
+    assert found, "String-key type config should work for custom classes"
+    print("  pass test_string_type_config_custom_class")
+
+
+def test_type_config_via_toml_cli():
+    """TOML [type_config] section should work end-to-end via CLI."""
     test_dir = tempfile.mkdtemp(prefix="steptrace_test_tc_cli_")
     try:
-        # Write config file
-        cfg_path = os.path.join(test_dir, "myconfig.py")
+        # Write TOML config with type_config section
+        cfg_path = os.path.join(test_dir, "steptrace.toml")
         with open(cfg_path, "w") as f:
             f.write(
-                "import numpy as np\n"
-                "CONFIG = {\n"
-                "    np.ndarray: ['shape', 'dtype'],\n"
-                "}\n"
+                '[type_config]\n'
+                '"numpy.ndarray" = ["shape", "dtype"]\n'
             )
 
         # Write test script
@@ -525,7 +573,7 @@ def test_type_config_via_cli():
         result = subprocess.run(
             [
                 sys.executable, "-m", "steptrace", "run", script,
-                "--export", export, "--type-config", cfg_path,
+                "-o", export, "--config", cfg_path,
             ],
             capture_output=True, text=True, cwd=get_project_root(),
         )
@@ -549,31 +597,8 @@ def test_type_config_via_cli():
                 assert vd["shape"]["value"] == "(10, 20)"
                 assert "dtype" in vd
 
-        assert found, "shape should be in value_data via --type-config"
-        print("  pass test_type_config_via_cli")
-    finally:
-        shutil.rmtree(test_dir, ignore_errors=True)
-
-
-def test_type_config_cli_bad_file():
-    """--type-config with a missing file should fail gracefully."""
-    test_dir = tempfile.mkdtemp(prefix="steptrace_test_tc_cli_")
-    try:
-        script = os.path.join(test_dir, "dummy.py")
-        with open(script, "w") as f:
-            f.write("x = 1\n")
-
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "steptrace", "run", script,
-                "--export", "--type-config", "/nonexistent/config.py",
-            ],
-            capture_output=True, text=True, cwd=get_project_root(),
-        )
-        assert result.returncode != 0, "Should fail for missing type config"
-        assert "error" in result.stderr.lower() or "Error" in result.stderr
-
-        print("  pass test_type_config_cli_bad_file")
+        assert found, "shape should be in value_data via TOML type_config"
+        print("  pass test_type_config_via_toml_cli")
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 
@@ -642,7 +667,7 @@ main()
 """)
         export = os.path.join(test_dir, "trace.json")
         result = subprocess.run(
-            [sys.executable, "-m", "steptrace", "run", script, "--export", export],
+            [sys.executable, "-m", "steptrace", "run", script, "-o", export],
             capture_output=True, text=True, cwd=get_project_root(),
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
@@ -668,9 +693,9 @@ main()
 # ══════════════════════════════════════════════════════════════════════
 
 
-def test_type_config_name_matching_via_cli():
-    """Type config should match user-defined classes by name when running
-    via CLI (where isinstance fails because exec creates a new class)."""
+def test_type_config_name_matching_via_toml_cli():
+    """TOML type_config should match user-defined classes by name when
+    running via CLI (where isinstance is not available)."""
     test_dir = tempfile.mkdtemp(prefix="steptrace_test_name_match_")
     try:
         script = os.path.join(test_dir, "sensor.py")
@@ -692,21 +717,18 @@ def main():
 
 main()
 """)
-        cfg = os.path.join(test_dir, "tc.py")
+        cfg = os.path.join(test_dir, "steptrace.toml")
         with open(cfg, "w") as f:
-            # Define a *separate* class with the same name – isinstance
-            # will fail, but name-based matching should kick in.
             f.write(
-                "class Sensor:\n"
-                "    pass\n"
-                'CONFIG = {Sensor: ["reading"]}\n'
+                '[type_config]\n'
+                '"Sensor" = ["reading"]\n'
             )
 
         export = os.path.join(test_dir, "trace.json")
         result = subprocess.run(
             [
                 sys.executable, "-m", "steptrace", "run", script,
-                "--export", export, "--type-config", cfg,
+                "-o", export, "--config", cfg,
             ],
             capture_output=True, text=True, cwd=get_project_root(),
         )
@@ -730,9 +752,9 @@ main()
                 assert vd["reading"]["type"] == "int"
 
         assert found_reading, (
-            "reading property should appear in value_data via name matching"
+            "reading property should appear in value_data via TOML name matching"
         )
-        print("  pass test_type_config_name_matching_via_cli")
+        print("  pass test_type_config_name_matching_via_toml_cli")
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 
@@ -855,8 +877,8 @@ def test_function_tracking_method_with_args_skipped():
     print("  pass test_function_tracking_method_with_args_skipped")
 
 
-def test_function_tracking_via_cli():
-    """Function tracking should work end-to-end via CLI --type-config."""
+def test_function_tracking_via_toml_cli():
+    """Function tracking should work end-to-end via TOML type_config."""
     import numpy as np
 
     test_dir = tempfile.mkdtemp(prefix="steptrace_test_func_cli_")
@@ -871,18 +893,18 @@ def test_function_tracking_via_cli():
                 "main()\n"
             )
 
-        cfg = os.path.join(test_dir, "tc.py")
+        cfg = os.path.join(test_dir, "steptrace.toml")
         with open(cfg, "w") as f:
             f.write(
-                "import numpy as np\n"
-                'CONFIG = {np.ndarray: ["shape", "sum"]}\n'
+                '[type_config]\n'
+                '"numpy.ndarray" = ["shape", "sum"]\n'
             )
 
         export = os.path.join(test_dir, "trace.json")
         result = subprocess.run(
             [
                 sys.executable, "-m", "steptrace", "run", script,
-                "--export", export, "--type-config", cfg,
+                "-o", export, "--config", cfg,
             ],
             capture_output=True, text=True, cwd=get_project_root(),
         )
@@ -907,8 +929,8 @@ def test_function_tracking_via_cli():
                 assert "12" in vd["sum"]["value"]
                 assert vd["sum"].get("source") == "function"
 
-        assert found, "shape and sum should be in value_data via CLI"
-        print("  pass test_function_tracking_via_cli")
+        assert found, "shape and sum should be in value_data via TOML config"
+        print("  pass test_function_tracking_via_toml_cli")
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 
@@ -998,35 +1020,34 @@ if __name__ == "__main__":
     test_class_filter_via_cli()
     test_inheritance_class_bodies_filtered()
 
-    # Type config loading
-    test_load_type_config_single_string()
-    test_load_type_config_list()
-    test_load_type_config_missing_config_raises()
-    test_load_type_config_bad_type_raises()
-
-    # Type config in tracer
+    # Type config in tracer (programmatic API with type objects)
     test_type_config_numpy_shape_exported()
     test_type_config_multiple_props()
     test_type_config_no_config_no_extra_props()
     test_type_config_custom_class_extra_property()
     test_type_config_subclass_inherits()
 
-    # Type config via CLI
-    test_type_config_via_cli()
-    test_type_config_cli_bad_file()
+    # String-based type config (TOML format)
+    test_string_type_config_simple_name()
+    test_string_type_config_module_qualified()
+    test_string_type_config_inheritance()
+    test_string_type_config_custom_class()
+
+    # Type config via TOML CLI
+    test_type_config_via_toml_cli()
 
     # Class body variable leak prevention
     test_class_body_vars_not_leaked()
     test_class_body_vars_not_leaked_via_cli()
 
-    # Name-based type config matching
-    test_type_config_name_matching_via_cli()
+    # Name-based type config matching via TOML
+    test_type_config_name_matching_via_toml_cli()
 
     # Function tracking
     test_function_tracking_ndarray_sum()
     test_function_tracking_custom_class()
     test_function_tracking_method_with_args_skipped()
-    test_function_tracking_via_cli()
+    test_function_tracking_via_toml_cli()
 
     # Config tracking without __dict__
     test_config_attrs_without_dict()
