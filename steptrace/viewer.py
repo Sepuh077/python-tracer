@@ -108,18 +108,38 @@ class Viewer:
         self.instance_scroll = 0
         self.instance_path = []    # [(name, type)] breadcrumb
 
+        # Exception inspection state
+        self.cur_exception = None
+
     # ── Item list ───────────────────────────────────────────────────────
 
     def _items(self):
-        """Return displayable items: calls then variables."""
+        """Return displayable items in step order: calls, variable events, exceptions."""
         items = []
         if self.node is None:
             return items
+
+        # Collect calls with their step numbers
         for c in self.node.get("calls", []):
-            items.append(("call", c))
+            step = c.get("step_start", 0)
+            items.append((step, "call", c, None))
+
+        # Collect individual variable history events
         for v in self.node.get("variables", []):
-            items.append(("variable", v))
-        return items
+            for h in v.get("history", []):
+                step = h.get("step", 0)
+                items.append((step, "var_event", v, h))
+
+        # Collect exception events
+        for exc in self.node.get("exceptions", []):
+            step = exc.get("step", 0)
+            items.append((step, "exception", exc, None))
+
+        # Sort by step number
+        items.sort(key=lambda x: x[0])
+
+        # Return as 3-tuples: (kind, data, extra)
+        return [(kind, data, extra) for _, kind, data, extra in items]
 
     # ── Navigation ──────────────────────────────────────────────────────
 
@@ -128,17 +148,26 @@ class Viewer:
             items = self._items()
             if not items or self.sel >= len(items):
                 return
-            kind, data = items[self.sel]
+            kind, data, extra = items[self.sel]
             if kind == "call":
                 self.path_stack.append((self.node, self.sel, self.scroll))
                 self.node = data
                 self.sel = 0
                 self.scroll = 0
-            elif kind == "variable":
+            elif kind == "var_event":
                 self.mode = "variable"
                 self.cur_var = data
-                self.var_sel = 0
+                # Jump to the specific history entry the user clicked on
+                idx = 0
+                for i, h in enumerate(data.get("history", [])):
+                    if h is extra:
+                        idx = i
+                        break
+                self.var_sel = idx
                 self.var_scroll = 0
+            elif kind == "exception":
+                self.mode = "exception"
+                self.cur_exception = data
         elif self.mode == "variable":
             if self.cur_var:
                 history = self.cur_var.get("history", [])
@@ -173,6 +202,10 @@ class Viewer:
                         (key, attr.get("type", "?")))
 
     def _back(self):
+        if self.mode == "exception":
+            self.mode = "tree"
+            self.cur_exception = None
+            return
         if self.mode == "instance":
             if self.instance_stack:
                 (self.instance_data, self.instance_keys,
@@ -227,6 +260,8 @@ class Viewer:
 
             if self.mode == "tree":
                 self._draw_tree(stdscr, h, w)
+            elif self.mode == "exception":
+                self._draw_exception_detail(stdscr, h, w)
             elif self.mode == "instance":
                 self._draw_instance(stdscr, h, w)
             else:
@@ -329,6 +364,8 @@ class Viewer:
         _put(win, row, 0, " " * (w - 1), curses.A_REVERSE)
         if self.mode == "tree":
             txt = " \u2191\u2193/jk Navigate | Enter/\u2192 Open | Esc/\u2190 Back | g/G Top/Bottom | q Quit "
+        elif self.mode == "exception":
+            txt = " Esc/\u2190 Back | q Quit "
         elif self.mode == "instance":
             txt = " \u2191\u2193/jk Navigate | Enter/\u2192 Expand | Esc/\u2190 Back | g/G Top/Bottom | q Quit "
         else:
@@ -397,7 +434,7 @@ class Viewer:
         _hline(win, row, w)
         row += 1
 
-        # Items (calls + variables)
+        # Items (calls + variable events + exceptions, in step order)
         items = self._items()
         content_top = row
         content_h = h - content_top - 1  # leave 1 for footer
@@ -412,36 +449,21 @@ class Viewer:
             if self.sel >= self.scroll + content_h:
                 self.scroll = self.sel - content_h + 1
 
-            # Find the transition index where calls end and variables begin
-            first_var_idx = None
-            for i, (k, _) in enumerate(items):
-                if k == "variable":
-                    first_var_idx = i
-                    break
-
             drawn = 0
             for i in range(self.scroll, len(items)):
                 if drawn >= content_h:
                     break
                 y = content_top + drawn
 
-                kind, data = items[i]
+                kind, data, extra = items[i]
                 is_sel = i == self.sel
-
-                # Section separator before variables
-                if i == first_var_idx and first_var_idx > 0:
-                    if drawn < content_h:
-                        _put(win, y, 3, "\u2500\u2500 Variables \u2500\u2500",
-                             curses.color_pair(C_SEP) | curses.A_DIM)
-                        drawn += 1
-                        y += 1
-                        if drawn >= content_h:
-                            break
 
                 if kind == "call":
                     self._draw_call_row(win, y, w, data, is_sel)
-                else:
-                    self._draw_var_row(win, y, w, data, is_sel)
+                elif kind == "var_event":
+                    self._draw_var_event_row(win, y, w, data, extra, is_sel)
+                elif kind == "exception":
+                    self._draw_exception_row(win, y, w, data, is_sel)
                 drawn += 1
 
         self._draw_footer(win, h, w)
@@ -470,16 +492,24 @@ class Viewer:
              curses.color_pair(C_TYPE) | curses.A_DIM | attr)
         off += len(kind_str)
 
-        # Inline args preview
-        args = data.get("args")
-        if args:
-            args_str = ", ".join(f"{k}={v}" for k, v in args.items())
-            avail = w - off - 4
-            if avail > 5:
-                if len(args_str) > avail:
-                    args_str = args_str[: avail - 3] + "..."
-                _put(win, y, off + 2, args_str,
-                     curses.color_pair(C_VALUE) | curses.A_DIM | attr)
+        # Exception indicator for calls that raised
+        exceptions = data.get("exceptions", [])
+        if exceptions:
+            exc_type = exceptions[0].get("type", "Exception")
+            exc_str = f" !! {exc_type}"
+            _put(win, y, off, exc_str,
+                 curses.color_pair(C_CHANGE) | curses.A_BOLD | attr)
+        else:
+            # Inline args preview
+            args = data.get("args")
+            if args:
+                args_str = ", ".join(f"{k}={v}" for k, v in args.items())
+                avail = w - off - 4
+                if avail > 5:
+                    if len(args_str) > avail:
+                        args_str = args_str[: avail - 3] + "..."
+                    _put(win, y, off + 2, args_str,
+                         curses.color_pair(C_VALUE) | curses.A_DIM | attr)
 
     def _draw_var_row(self, win, y, w, data, selected):
         """Draw one variable row."""
@@ -520,6 +550,150 @@ class Viewer:
             badge = f" [{mods}x changed]"
             _put(win, y, off + 1, badge,
                  curses.color_pair(C_CHANGE) | attr)
+
+    def _draw_var_event_row(self, win, y, w, var, entry, selected):
+        """Draw one variable event row (inline in step-ordered list)."""
+        attr = curses.A_REVERSE if selected else 0
+        if selected:
+            _put(win, y, 0, " " * (w - 1), attr)
+
+        prefix = " \u25b6 " if selected else "   "
+        _put(win, y, 0, prefix, attr)
+        off = len(prefix)
+
+        name = var.get("name", "?")
+        action = entry.get("action", "assign")
+        value = entry.get("value", "?")
+        val_type = entry.get("value_type", "?")
+
+        # Variable name
+        _put(win, y, off, name,
+             curses.color_pair(C_VAR) | curses.A_BOLD | attr)
+        off += len(name)
+
+        # Value
+        val_str = f" = {value}"
+        type_str = f" ({val_type})"
+        reserve = len(type_str) + 4
+        avail = w - off - reserve
+        if avail > 3 and len(val_str) > avail:
+            val_str = val_str[: avail - 3] + "..."
+        _put(win, y, off, val_str,
+             curses.color_pair(C_VALUE) | attr)
+        off += min(len(val_str), w - off - len(type_str) - 2)
+
+        # Type
+        _put(win, y, off, type_str,
+             curses.color_pair(C_TYPE) | curses.A_DIM | attr)
+        off += len(type_str)
+
+        # Action badge for modifications
+        if action == "modify":
+            badge = " [modified]"
+            _put(win, y, off, badge,
+                 curses.color_pair(C_CHANGE) | curses.A_DIM | attr)
+
+    def _draw_exception_row(self, win, y, w, exc, selected):
+        """Draw one exception row in the step-ordered list."""
+        attr = curses.A_REVERSE if selected else 0
+        if selected:
+            _put(win, y, 0, " " * (w - 1), attr)
+
+        prefix = " \u25b6 " if selected else "   "
+        _put(win, y, 0, prefix, attr)
+        off = len(prefix)
+
+        exc_type = exc.get("type", "Exception")
+        exc_msg = exc.get("message", "")
+        line = exc.get("line", "?")
+
+        _put(win, y, off, "!! ",
+             curses.color_pair(C_CHANGE) | curses.A_BOLD | attr)
+        off += 3
+
+        _put(win, y, off, exc_type,
+             curses.color_pair(C_CHANGE) | curses.A_BOLD | attr)
+        off += len(exc_type)
+
+        msg_str = f": {exc_msg}" if exc_msg else ""
+        avail = w - off - 15
+        if avail > 3 and len(msg_str) > avail:
+            msg_str = msg_str[: avail - 3] + "..."
+        if msg_str:
+            _put(win, y, off, msg_str,
+                 curses.color_pair(C_CHANGE) | attr)
+            off += len(msg_str)
+
+        line_str = f"  (line {line})"
+        _put(win, y, off, line_str,
+             curses.color_pair(C_TYPE) | curses.A_DIM | attr)
+
+    # ── Drawing: exception detail view ──────────────────────────────────
+
+    def _draw_exception_detail(self, win, h, w):
+        """Draw exception detail view (after clicking on an exception)."""
+        row = self._draw_header(win, h, w)
+
+        exc = self.cur_exception
+        if not exc:
+            return
+
+        exc_type = exc.get("type", "Exception")
+        exc_msg = exc.get("message", "")
+        line = exc.get("line", "?")
+        step = exc.get("step", "?")
+
+        # Exception title
+        _put(win, row, 1, "Exception: ",
+             curses.color_pair(C_TYPE))
+        _put(win, row, 12, exc_type,
+             curses.color_pair(C_CHANGE) | curses.A_BOLD)
+        row += 1
+
+        # Message
+        if exc_msg:
+            _put(win, row, 1, "Message: ",
+                 curses.color_pair(C_TYPE))
+            msg_avail = w - 11
+            msg_display = exc_msg[:msg_avail] if len(exc_msg) > msg_avail else exc_msg
+            _put(win, row, 10, msg_display,
+                 curses.color_pair(C_VALUE))
+            row += 1
+
+        # Location
+        _put(win, row, 1, f"Line: {line}  |  Step: {step}",
+             curses.color_pair(C_TYPE) | curses.A_DIM)
+        row += 1
+
+        # Context breadcrumb
+        _put(win, row, 1, "in: ",
+             curses.color_pair(C_TYPE) | curses.A_DIM)
+        _put(win, row, 5, self._breadcrumb(),
+             curses.color_pair(C_PATH) | curses.A_DIM)
+        row += 1
+
+        _hline(win, row, w)
+        row += 1
+
+        # Traceback
+        tb_lines = exc.get("traceback", [])
+        if tb_lines:
+            _put(win, row, 1, "Traceback:",
+                 curses.color_pair(C_HEADER) | curses.A_BOLD)
+            row += 1
+
+            for tb_line in tb_lines:
+                for sub_line in tb_line.rstrip().split('\n'):
+                    if row >= h - 1:
+                        break
+                    _put(win, row, 3, sub_line,
+                         curses.color_pair(C_TYPE) | curses.A_DIM)
+                    row += 1
+        else:
+            _put(win, row, 3, "No traceback available.",
+                 curses.color_pair(C_TYPE) | curses.A_DIM)
+
+        self._draw_footer(win, h, w)
 
     # ── Drawing: variable history view ──────────────────────────────────
 

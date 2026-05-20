@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import time
+import traceback as _tb_module
 import types
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -132,6 +133,7 @@ class StructuredTracer(Tracer):
             "variables": {},
             "args": args or {},
             "return_value": None,
+            "exceptions": [],
             "duration_ms": 0.0,
             "step_start": self._step,
             "step_end": None,
@@ -614,6 +616,30 @@ class StructuredTracer(Tracer):
                         self._scope_vars.pop(frame_id, None)
                         self._prev_line.pop(frame_id, None)
 
+            elif event == "exception":
+                exc_type_obj, exc_value, exc_tb = arg
+                if exc_value is not None:
+                    exc_id = id(exc_value)
+                    if exc_id not in self._recorded_exceptions:
+                        node = self._frame_to_node.get(frame_id)
+                        if node is None and self._call_stack:
+                            node = self._call_stack[-1]
+                        if node is not None:
+                            self._recorded_exceptions[exc_id] = exc_value
+                            self._step += 1
+                            tb_lines = []
+                            try:
+                                tb_lines = _tb_module.format_tb(exc_tb)
+                            except Exception:
+                                pass
+                            node["exceptions"].append({
+                                "type": exc_type_obj.__name__ if exc_type_obj else "Unknown",
+                                "message": str(exc_value) if exc_value else "",
+                                "line": frame.f_lineno,
+                                "step": self._step,
+                                "traceback": tb_lines,
+                            })
+
         except Exception:
             pass  # Never crash the user's program
 
@@ -669,6 +695,7 @@ class StructuredTracer(Tracer):
         self._coro_frame_nodes = {}
         self._coro_frames = {}
         self._orphan_parent = None
+        self._recorded_exceptions = {}  # id(exc) -> exc (strong ref prevents id reuse)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         sys.settrace(self._previous_trace)

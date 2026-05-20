@@ -171,6 +171,9 @@ def run_script(args):
         import traceback
 
         traceback.print_exc()
+        if os.path.exists(tracer.export_path):
+            print(f"Structured trace saved to: {tracer.export_path}")
+            print(f"View with: python -m steptrace view {tracer.export_path}")
         return 1
 
 
