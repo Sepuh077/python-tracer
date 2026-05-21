@@ -4,8 +4,9 @@ Command-line interface for steptrace.
 
 Usage:
     python -m steptrace run script.py [args...]
-    python -m steptrace run script.py --config config.yaml
-    python -m steptrace run script.py --config config.toml
+    python -m steptrace run script.py --config steptrace.toml
+    python -m steptrace run script.py -o trace.json
+    python -m steptrace view
 """
 
 import argparse
@@ -14,7 +15,6 @@ import sys
 from pathlib import Path
 
 from .config import load_config, merge_config_with_args
-from .tracer import LogLevel, LogOutput, Tracer, VariableMode
 
 
 def create_parser():
@@ -26,11 +26,11 @@ def create_parser():
         epilog="""
 Examples:
     python -m steptrace run script.py
-    python -m steptrace run script.py --log-output STDOUT
-    python -m steptrace run script.py --log-level DEBUG --variable-mode CHANGED
-    python -m steptrace run script.py --trace-async
-    python -m steptrace run script.py --config config.yaml
+    python -m steptrace run script.py -o trace.json
+    python -m steptrace run script.py --config steptrace.toml
     python -m steptrace run script.py -- arg1 arg2  (args after -- go to script)
+    python -m steptrace view                        (view latest trace)
+    python -m steptrace view .tracer/trace.json     (view specific file)
         """,
     )
 
@@ -44,29 +44,23 @@ Examples:
     run_parser.add_argument(
         "-c",
         "--config",
-        help="Path to configuration file (YAML or TOML)",
+        help="Path to TOML configuration file",
         metavar="FILE",
+    )
+
+    # Output path
+    run_parser.add_argument(
+        "-o",
+        "--output",
+        help="Custom path for trace JSON output (default: .tracer/trace.json)",
+        metavar="FILE",
+        default=None,
     )
 
     # Tracer options
     run_parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "SILENT"],
-        help="Log verbosity level (default: INFO)",
-    )
-    run_parser.add_argument(
-        "--log-output",
-        choices=["FILE", "STDOUT", "STDERR", "FILE_STDOUT", "FILE_STDERR"],
-        help="Output destination (default: FILE)",
-    )
-    run_parser.add_argument(
-        "--variable-mode",
-        choices=["ALL", "CHANGED", "NONE"],
-        help="Variable logging mode (default: ALL)",
-    )
-    run_parser.add_argument(
         "--log-dir",
-        help="Directory for log files (default: .tracer)",
+        help="Directory for trace output (default: .tracer)",
         default=None,
     )
     run_parser.add_argument(
@@ -81,25 +75,22 @@ Examples:
         metavar="FUNC",
     )
 
-    # Async tracing options
-    run_parser.add_argument(
-        "--trace-async",
-        action="store_true",
-        help="Enable tracing of asyncio coroutines and await points",
+    # View command
+    view_parser = subparsers.add_parser(
+        "view", help="Interactively view a structured trace file"
     )
-    run_parser.add_argument(
-        "--async-threshold-ms",
-        type=float,
-        default=0.0,
-        help="Only log await points taking longer than this threshold (ms)",
-        metavar="MS",
+    view_parser.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="Path to the trace JSON file (default: most recent in .tracer/)",
     )
 
     return parser
 
 
 def run_script(args):
-    """Run a script with tracing enabled."""
+    """Run a script with structured tracing enabled."""
     script_path = os.path.abspath(args.script)
 
     if not os.path.exists(script_path):
@@ -145,51 +136,55 @@ def run_script(args):
     # Compile the script
     compiled = compile(script_code, script_path, "exec")
 
-    # Determine if we need async tracing
-    trace_async = tracer_kwargs.pop("trace_async", False)
-    async_threshold_ms = tracer_kwargs.pop("async_threshold_ms", 0.0)
-
     # Override workspace to be the script's directory
     tracer_kwargs["_workspace_override"] = script_dir
 
-    # Create the tracer
-    if trace_async:
-        from .async_tracer import AsyncTracer
+    # Extract type_config from merged kwargs (not a Tracer kwarg)
+    type_config = tracer_kwargs.pop("type_config", None)
 
-        tracer = AsyncTracer(
-            await_threshold_ms=async_threshold_ms,
-            **tracer_kwargs,
-        )
-    else:
-        tracer = Tracer(**tracer_kwargs)
+    # Always use StructuredTracer for JSON export
+    from .structured_tracer import StructuredTracer
+
+    export_path = getattr(args, "output", None)
+    tracer = StructuredTracer(
+        export_path=export_path,
+        script_path=script_path,
+        type_config=type_config,
+        **tracer_kwargs,
+    )
 
     # Run the script with tracing
     print(f"Tracing: {script_path}")
-    if tracer.log_path:
-        print(f"Log output: {tracer.log_path}")
+    print(f"Structured trace output: {tracer.export_path}")
 
     try:
         with tracer:
             exec(compiled, script_globals)
+        print(f"Structured trace saved to: {tracer.export_path}")
+        print(f"View with: python -m steptrace view {tracer.export_path}")
         return 0
     except SystemExit as e:
+        print(f"Structured trace saved to: {tracer.export_path}")
         return e.code if isinstance(e.code, int) else 0
     except Exception as e:
         print(f"Error running script: {e}", file=sys.stderr)
         import traceback
 
         traceback.print_exc()
+        if os.path.exists(tracer.export_path):
+            print(f"Structured trace saved to: {tracer.export_path}")
+            print(f"View with: python -m steptrace view {tracer.export_path}")
         return 1
 
 
 def main():
     """Main entry point for CLI."""
     parser = create_parser()
-    
+
     # Use parse_known_args to allow options after script name
     # Unknown args will be passed to the script
     args, unknown = parser.parse_known_args()
-    
+
     if args.command == "run":
         # Process unknown args as script arguments
         # Remove leading '--' separator if present
@@ -198,6 +193,10 @@ def main():
             script_args = script_args[1:]
         args.script_args = script_args
         return run_script(args)
+    elif args.command == "view":
+        from .viewer import main as viewer_main
+
+        return viewer_main(getattr(args, "file", None))
     else:
         parser.print_help()
         return 0

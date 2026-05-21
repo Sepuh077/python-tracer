@@ -1,16 +1,7 @@
 # Example steptrace configuration file (TOML)
 # Copy to your project root or specify with --config
 
-# Log verbosity level: DEBUG, INFO, WARNING, ERROR, SILENT
-log_level = "INFO"
-
-# Output destination: FILE, STDOUT, STDERR, FILE_STDOUT, FILE_STDERR
-log_output = "FILE"
-
-# Variable logging mode: ALL, CHANGED, NONE
-variable_mode = "ALL"
-
-# Directory for log files
+# Directory for trace output files
 log_dir = ".tracer"
 
 # Filter to only trace workspace files (recommended)
@@ -19,6 +10,11 @@ filter_workspace = true
 # Optional: List of function names to trace (omit to trace all)
 # traceable_functions = ["main", "my_function"]
 
-# Asyncio tracing options
-trace_async = false
-async_threshold_ms = 0.0
+# Type-specific property and method tracking
+# Map class names to properties/methods to record in the structured trace.
+# Use "module.ClassName" to disambiguate when multiple classes share a name.
+# Callable attributes (methods) are invoked with no arguments automatically.
+[type_config]
+"ndarray" = ["shape", "dtype", "sum"]
+"simple_script.Vector2D" = ["x", "y", "magnitude"]
+# "myapp.models.User" = ["full_name", "is_active"]

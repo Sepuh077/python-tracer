@@ -521,6 +521,73 @@ with Tracer():
 
 ---
 
+## Structured Export & Interactive Viewer
+
+Export a structured JSON trace and view it in an interactive TUI:
+
+```bash
+# Export trace
+python -m steptrace run script.py --export
+
+# View latest trace
+python -m steptrace view
+
+# View specific trace file
+python -m steptrace view .tracer/trace.json
+```
+
+### Type Config (Properties & Functions)
+
+When using `--export`, you can specify a **type config** file that tells the
+tracer which extra attributes and method results to record for each type.
+
+Create a Python file (e.g. `type_config.py`):
+
+```python
+import numpy as np
+
+# For user-defined classes in the traced script, create stub classes
+# with the same name — the tracer matches by class name.
+class Sprite:
+    pass
+
+CONFIG = {
+    # Attributes are read directly; methods are called with no args
+    np.ndarray: ["shape", "dtype", "sum"],
+    Sprite:     ["is_alive"],
+}
+```
+
+Run with the config:
+
+```bash
+python -m steptrace run script.py --export --type-config type_config.py
+python -m steptrace view
+```
+
+#### How it works
+
+| Config entry | Kind      | What is recorded |
+|---|---|---|
+| `"shape"` on `ndarray` | attribute | The value of `arr.shape` |
+| `"sum"` on `ndarray`   | function  | The return value of `arr.sum()` |
+| `"is_alive"` on `Sprite` | property | The computed value of `sprite.is_alive` |
+
+- **Attributes and `@property`** values are read directly via `getattr`.
+- **Zero-argument methods** are *called* and their return value is stored.
+  Methods that require arguments are silently skipped.
+- For **user-defined classes** in the traced script, matching works by
+  class name (not by object identity), so stub classes in the config file
+  work seamlessly.
+- Config entries are tracked on **every assignment and modification** of the
+  variable, not just the first time.
+- Types without a useful `__dict__` (like `numpy.ndarray`) are fully
+  supported — the config entries provide the attribute data.
+
+See `examples/type_config_example.py` for a complete example.
+
+---
+
 ## Testing
 
 Run the test suite:
@@ -539,6 +606,7 @@ python tests/test_all_options.py
 python tests/test_config.py
 python tests/test_async_tracer.py
 python tests/test_cli.py
+python tests/test_class_filter_and_type_config.py
 ```
 
 ---
